@@ -1,5 +1,22 @@
 # @vantageos/data-lake — Changelog
 
+## Unreleased — chunk namespace (T2, BM25-only, zero embeddings)
+
+**Feature**: adds a `chunks` table + `chunksV1` namespace (`upsert`,
+`search`) to the Component — documentary chunk storage isolated by
+`(orgId, scope)`, keyed for upsert by `(orgId, scope, chunkId)`, searched
+via native Convex BM25 full-text (`searchIndex`, no vector/embedding
+index). Ported from `@vantageos/corpus`'s `insertChunks`/`searchCorpus`
+contract so downstream consumers (Thémis droit-du-travail, Talos corpus)
+can migrate off `@vantageos/corpus` without a data-shape change. See
+`component/chunksV1.ts`, `component/normalizeSourceChunk.ts`,
+`component/loadChunks.ts`. 24/24 tests (RED before, GREEN after) — VP task
+`k170j3b94dpfwxmrm2qxtwm5p18bqqjm`.
+
+Also adds the vitest/convex-test dev harness (`package.json`
+devDependencies, `vitest.config.ts`, `tsconfig.json`) — the Component had
+no test tooling committed prior to this change.
+
 ## 0.3.1 — 2026-05-24 (Day 80) — patch : `scripts/` excluded from tarball
 
 **Bug fix** : `scripts/verify-tarball.mjs` (the anti-recurrence
