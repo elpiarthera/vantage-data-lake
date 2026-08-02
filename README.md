@@ -161,7 +161,7 @@ The prepared deprecation command for whoever runs T4 (publish-side; NOT
 run as part of this change):
 
 ```bash
-npm deprecate @vantageos/corpus@">=0.0.0" "Deprecated: absorbed into @vantageos/data-lake's chunksV1 namespace (insertChunks/searchCorpus, byte-identical contract). See https://github.com/vantageos-agency/vantage-peers/tree/main/packages/data-lake#deprecating-vantageoscorpus"
+npm deprecate @vantageos/corpus@">=0.0.0" "Deprecated: absorbed into @vantageos/data-lake's chunksV1 namespace (insertChunks/searchCorpus, byte-identical contract). See https://github.com/elpiarthera/vantage-data-lake#deprecating-vantageoscorpus"
 ```
 
 ## References
