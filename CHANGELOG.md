@@ -1,5 +1,29 @@
 # @vantageos/data-lake — Changelog
 
+## 0.3.2 — 2026-08-02 — reconstituted source + chunk namespace + corpus contract + FSL license fix
+
+Consolidated release covering four T4 sub-steps landed on `main`:
+
+- **Reconstituted source (T1)**: full 0.3.1 Component source (`component/`,
+  `convex.config.ts`, `_generated`) recovered and re-committed after prior
+  loss, restoring the publishable tree used as the base for this release.
+- **Chunk namespace (T2)**: new `chunks` table + `chunksV1` namespace —
+  documentary chunk storage isolated by `(orgId, scope)`, BM25-only
+  (zero embeddings, no vector index), upsert-by-`(orgId, scope, chunk_id)`,
+  functions `chunksV1.insertChunks` / `chunksV1.searchCorpus`.
+- **Corpus contract absorbed 1:1 (T3)**: `chunks` schema, index, and
+  function names reconciled byte-identically to `@vantageos/corpus`'s
+  public contract (snake_case `chunk_id`/`section_title`/
+  `legal_references`/`source_ref`, index `by_org_scope_chunk`). One
+  `chunks` table throughout, no divergent second table. `@vantageos/corpus`
+  is deprecated in favor of this component's `chunksV1` namespace.
+- **FSL license fix (T4-license)**: license metadata corrected to
+  `FSL-1.1-Apache-2.0` (Functional Source License converting to Apache 2.0),
+  matching the fleet's licensing policy for Convex components.
+
+25/25 tests green. See sections below for the detailed per-step history
+that this release consolidates.
+
 ## Unreleased — absorb @vantageos/corpus chunk contract 1:1 + deprecate corpus (T3)
 
 **Reconciliation**: T2 shipped the `chunks` table + `chunksV1` namespace
