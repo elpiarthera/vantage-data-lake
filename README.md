@@ -106,6 +106,38 @@ E.0). Compute it host-side via your own `aiClient.ts` action and pass the
 | `searchV1.textSearch` | Pure BM25 text search |
 | `searchV1.hybridSearch` | Legacy hybrid action (v0.1.0 signature, kept for VP host) |
 | `searchV1.searchFixPatterns` | Hydrated vector search over the `fixpatterns` namespace |
+| `chunksV1.upsert` | Upsert N documentary chunks under `(orgId, scope)`, keyed by `chunkId` — no embedding required |
+| `chunksV1.search` | BM25-only full-text search over chunks, scoped to `(orgId, scope)` — zero embeddings |
+
+### `chunksV1` — BM25-only chunk namespace (zero embeddings)
+
+Documentary chunk storage isolated by caller-supplied `(orgId, scope)` —
+same "no `ctx.auth`" rationale as `memoriesV1`/`episodesV1`. No embedding
+or AI Gateway call is ever made by this path; search runs entirely inside
+Convex's native full-text index.
+
+```ts
+await ctx.runMutation(components.dataLake.component.chunksV1.upsert, {
+  orgId: "org-a",
+  scope: "droit-du-travail",
+  chunks: [
+    {
+      chunkId: "chunk-1",
+      text: "Le contrat de travail à durée indéterminée...",
+      sectionTitle: "Article L1221-1",
+      legalReferences: ["Code du travail L1221-1"],
+      sourceRef: "https://legifrance.gouv.fr/L1221-1",
+    },
+  ],
+});
+
+const results = await ctx.runQuery(components.dataLake.component.chunksV1.search, {
+  orgId: "org-a",
+  scope: "droit-du-travail",
+  query: "période d'essai",
+  limit: 10,
+});
+```
 
 ## References
 

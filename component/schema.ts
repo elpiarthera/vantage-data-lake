@@ -103,4 +103,38 @@ export default defineSchema({
 		.index("by_type", ["type", "isLatest"])
 		.index("by_creator", ["createdBy", "isLatest"])
 		.index("by_namespace_type", ["namespace", "type", "isLatest"]),
+
+	// ── chunks ──────────────────────────────────────────────────────────────────
+	// Convergence KB namespace (VP task k170j3b94dpfwxmrm2qxtwm5p18bqqjm, T2).
+	// Documentary chunk storage: (orgId, scope) isolation, native Convex BM25
+	// full-text search — ZERO embeddings, ZERO external API call. Ported from
+	// @vantageos/corpus's `insertChunks` / `searchCorpus` contract so BU
+	// consumers (Thémis droit-du-travail, Talos corpus) can migrate off
+	// @vantageos/corpus without a data-shape change.
+	//
+	// This is a THIRD, independent isolation axis alongside `memories.namespace`
+	// and kb's `team/<orgId>/<docId>` convention — orgId + scope is
+	// caller-supplied (never `ctx.auth`), deny by default: orgId is the FIRST
+	// field of every index, so a query with no orgId cannot resolve an index.
+	chunks: defineTable({
+		orgId: v.string(),
+		scope: v.string(),
+		chunkId: v.string(),
+		text: v.string(),
+		sectionTitle: v.optional(v.string()),
+		legalReferences: v.array(v.string()),
+		sourceRef: v.string(),
+		createdAt: v.number(),
+	})
+		// Upsert + point lookup by (orgId, scope, chunkId) — deny by default,
+		// isolation fields first.
+		.index("by_org_scope_chunkid", ["orgId", "scope", "chunkId"])
+		// Row listing / test assertions scoped to (orgId, scope).
+		.index("by_org_scope", ["orgId", "scope"])
+		// BM25 full-text search on `text`, filtered inside the search index
+		// itself by (orgId, scope) — NO vector/embedding index on this table.
+		.searchIndex("search_text", {
+			searchField: "text",
+			filterFields: ["orgId", "scope"],
+		}),
 });
