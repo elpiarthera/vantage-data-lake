@@ -1,17 +1,63 @@
 # @vantageos/data-lake — Changelog
 
-## Unreleased — chunk namespace (T2, BM25-only, zero embeddings)
+## Unreleased — absorb @vantageos/corpus chunk contract 1:1 + deprecate corpus (T3)
 
-**Feature**: adds a `chunks` table + `chunksV1` namespace (`upsert`,
-`search`) to the Component — documentary chunk storage isolated by
-`(orgId, scope)`, keyed for upsert by `(orgId, scope, chunkId)`, searched
-via native Convex BM25 full-text (`searchIndex`, no vector/embedding
-index). Ported from `@vantageos/corpus`'s `insertChunks`/`searchCorpus`
-contract so downstream consumers (Thémis droit-du-travail, Talos corpus)
-can migrate off `@vantageos/corpus` without a data-shape change. See
-`component/chunksV1.ts`, `component/normalizeSourceChunk.ts`,
-`component/loadChunks.ts`. 24/24 tests (RED before, GREEN after) — VP task
-`k170j3b94dpfwxmrm2qxtwm5p18bqqjm`.
+**Reconciliation**: T2 shipped the `chunks` table + `chunksV1` namespace
+under a camelCase convention (`chunkId`, `sectionTitle`, `legalReferences`,
+`sourceRef`, index `by_org_scope_chunkid`, functions `chunksV1.upsert` /
+`chunksV1.search`). T3 (VP task `k170v3p0sxty10jv8ba9vg45x18bpbeq`)
+reconciles this to `@vantageos/corpus`'s public contract BYTE-IDENTICALLY:
+
+- Table `chunks` fields renamed to snake_case: `chunk_id`, `section_title`,
+  `legal_references`, `source_ref` (matches corpus's
+  `component/schema.ts` exactly).
+- Index renamed `by_org_scope_chunkid` -> `by_org_scope_chunk` (matches
+  corpus's index name exactly).
+- Functions renamed `chunksV1.upsert` -> `chunksV1.insertChunks`,
+  `chunksV1.search` -> `chunksV1.searchCorpus` (matches corpus's function
+  names, args, and result shape exactly — snake_case throughout).
+- `component/normalizeSourceChunk.ts` output type updated to snake_case;
+  `component/loadChunks.ts` is generic over `NormalizedChunk` and required
+  only comment updates.
+- ONE `chunks` table throughout — no divergent second table was created or
+  kept.
+
+Still BM25-only, zero embeddings, zero external API call — the existing
+hybrid/vector path in `searchV1.ts` is untouched.
+
+25/25 tests green (24 reconciled T2 assertions + 1 new corpus-contract-
+parity round-trip test asserting `insertChunks` then `searchCorpus` returns
+the exact corpus wire shape). RED before this reconciliation (functions
+named `upsert`/`search`, camelCase fields), GREEN after.
+
+**Known gap — wire-path parity, host-app follow-up required**: Talos's
+ingestion worker (`vantage-corpus-worker/src/corpus_client.py`) calls the
+Convex HTTP API at the bare path `corpus:insertChunks`. A Convex
+Component's exports are namespaced under a host app's
+`components.dataLake.chunksV1.*` and are not directly reachable at that
+bare path — only a top-level `convex/corpus.ts` file in whichever HOST app
+mounts this component (re-exposing `insertChunks`/`searchCorpus` at that
+exact path) closes the zero-code-change CONVEX_URL repoint. That host-app
+wiring is outside this package's scope (this repo ships the Component
+only, no top-level `convex/` app).
+
+**Deprecation**: `@vantageos/corpus` is superseded by this component's
+`chunksV1` namespace. See README "Deprecating @vantageos/corpus" section
+for the prepared `npm deprecate` command (T4 runs it, not this change).
+
+## Unreleased (T2) — chunk namespace (BM25-only, zero embeddings)
+
+**Feature**: added a `chunks` table + `chunksV1` namespace to the
+Component — documentary chunk storage isolated by `(orgId, scope)`,
+searched via native Convex BM25 full-text (`searchIndex`, no
+vector/embedding index). Ported from `@vantageos/corpus`'s
+`insertChunks`/`searchCorpus` contract so downstream consumers (Thémis
+droit-du-travail, Talos corpus) can migrate off `@vantageos/corpus`
+without a data-shape change. See `component/chunksV1.ts`,
+`component/normalizeSourceChunk.ts`, `component/loadChunks.ts`. 24/24
+tests (RED before, GREEN after) — VP task
+`k170j3b94dpfwxmrm2qxtwm5p18bqqjm`. Field names/index/function names were
+since reconciled to corpus's snake_case in T3 above.
 
 Also adds the vitest/convex-test dev harness (`package.json`
 devDependencies, `vitest.config.ts`, `tsconfig.json`) — the Component had

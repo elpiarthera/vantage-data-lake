@@ -4,10 +4,12 @@ import type { NormalizedChunk } from "./normalizeSourceChunk.js";
 
 // component/loadChunks.test.ts — ported from vantage-memory's
 // convex/loadChunks.test.ts (VP task k170j3b94dpfwxmrm2qxtwm5p18bqqjm, T2),
-// field names renamed to this Component's camelCase convention (chunk_id ->
-// chunkId). RED-then-GREEN, pure unit against a mocked upsertChunks (no
-// Convex runtime needed to prove the batching mechanics; chunksV1.test.ts
-// already covers `upsert` itself against the real convex-test harness).
+// reconciled in T3 (k170v3p0sxty10jv8ba9vg45x18bpbeq) onto the snake_case
+// `NormalizedChunk` shape (chunk_id, legal_references, source_ref) that now
+// matches @vantageos/corpus's insertChunks contract byte-for-byte.
+// RED-then-GREEN, pure unit against a mocked upsertChunks (no Convex runtime
+// needed to prove the batching mechanics; chunksV1.test.ts already covers
+// `insertChunks` itself against the real convex-test harness).
 //
 // RED (recorded verbatim, captured BEFORE component/loadChunks.ts existed):
 //
@@ -17,10 +19,10 @@ import type { NormalizedChunk } from "./normalizeSourceChunk.js";
 
 function makeChunks(n: number): NormalizedChunk[] {
 	return Array.from({ length: n }, (_, i) => ({
-		chunkId: `chunk-${i}`,
+		chunk_id: `chunk-${i}`,
 		text: `text ${i}`,
-		legalReferences: [],
-		sourceRef: `src/${i}`,
+		legal_references: [],
+		source_ref: `src/${i}`,
 	}));
 }
 
