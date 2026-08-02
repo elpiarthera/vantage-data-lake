@@ -3,9 +3,12 @@ import { normalizeSourceChunk } from "./normalizeSourceChunk.js";
 
 // component/normalizeSourceChunk.test.ts — ported from vantage-memory's
 // convex/normalizeSourceChunk.test.ts (VP task k170j3b94dpfwxmrm2qxtwm5p18bqqjm,
-// T2), field names renamed to this Component's camelCase convention
-// (chunk_id -> chunkId, section_title -> sectionTitle, legal_references ->
-// legalReferences, source_ref -> sourceRef). Assertions unchanged.
+// T2), then reconciled in T3 (k170v3p0sxty10jv8ba9vg45x18bpbeq): the OUTPUT
+// assertions now check snake_case (chunk_id, section_title,
+// legal_references, source_ref) matching the data-lake contract's byte-
+// identical @vantageos/corpus shape. The INPUT `sourceChunk` fixtures stay
+// camelCase — they represent the upstream domain pipeline's own field
+// convention, unchanged by this reconciliation.
 //
 // RED-then-GREEN, pure unit (zero I/O, zero Convex runtime), against the
 // REAL object shape emitted by vantage-paperasse's droit-du-travail
@@ -39,18 +42,18 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result.chunkId).toBe("LEGIARTI000006901111");
+		expect(result.chunk_id).toBe("LEGIARTI000006901111");
 		expect(result.text).toBe(sourceChunk.text);
-		expect(result.sectionTitle).toBeUndefined();
-		expect(result.legalReferences).toEqual(["Code du travail L1234-1"]);
-		expect(typeof result.legalReferences[0]).toBe("string");
-		expect(result.sourceRef).toBe(
+		expect(result.section_title).toBeUndefined();
+		expect(result.legal_references).toEqual(["Code du travail L1234-1"]);
+		expect(typeof result.legal_references[0]).toBe("string");
+		expect(result.source_ref).toBe(
 			"https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI000006901111",
 		);
-		expect(typeof result.sourceRef).toBe("string");
+		expect(typeof result.source_ref).toBe("string");
 	});
 
-	test("MUST_PASS: already-string legalReferences/sourceRef pass through unchanged", () => {
+	test("MUST_PASS: already-string legalReferences/sourceRef pass through, output re-keyed to snake_case", () => {
 		const sourceChunk = {
 			chunkId: "L1234-1_art1",
 			text: "Article L1234-1 text.",
@@ -61,7 +64,13 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result).toEqual(sourceChunk);
+		expect(result).toEqual({
+			chunk_id: "L1234-1_art1",
+			text: "Article L1234-1 text.",
+			section_title: "Rupture du contrat",
+			legal_references: ["L1234-1"],
+			source_ref: "code-travail/L1234-1",
+		});
 	});
 
 	test("MUST_PASS: missing optional sectionTitle is preserved as undefined, never fabricated", () => {
@@ -74,7 +83,7 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result.sectionTitle).toBeUndefined();
+		expect(result.section_title).toBeUndefined();
 	});
 
 	test("MUST_PASS: empty legalReferences array maps to an empty string array", () => {
@@ -87,8 +96,8 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result.legalReferences).toEqual([]);
-		expect(result.sourceRef).toBe("https://example.org/p1");
+		expect(result.legal_references).toEqual([]);
+		expect(result.source_ref).toBe("https://example.org/p1");
 	});
 
 	test("MUST_PASS: object sourceRef without url falls back to pubId, never to a silent empty string", () => {
@@ -101,7 +110,7 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result.sourceRef).toBe("pub-only-id");
+		expect(result.source_ref).toBe("pub-only-id");
 	});
 
 	test("MUST_PASS: object legalReference missing code/text falls back to article_cid", () => {
@@ -114,7 +123,7 @@ describe("normalizeSourceChunk — object legalReferences/sourceRef -> contract 
 
 		const result = normalizeSourceChunk(sourceChunk);
 
-		expect(result.legalReferences).toEqual(["cid-4"]);
+		expect(result.legal_references).toEqual(["cid-4"]);
 	});
 
 	test("MUST_REFUSE: an object sourceRef with neither url nor pubId throws, naming the missing instrument", () => {

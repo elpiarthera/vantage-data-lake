@@ -106,37 +106,62 @@ E.0). Compute it host-side via your own `aiClient.ts` action and pass the
 | `searchV1.textSearch` | Pure BM25 text search |
 | `searchV1.hybridSearch` | Legacy hybrid action (v0.1.0 signature, kept for VP host) |
 | `searchV1.searchFixPatterns` | Hydrated vector search over the `fixpatterns` namespace |
-| `chunksV1.upsert` | Upsert N documentary chunks under `(orgId, scope)`, keyed by `chunkId` — no embedding required |
-| `chunksV1.search` | BM25-only full-text search over chunks, scoped to `(orgId, scope)` — zero embeddings |
+| `chunksV1.insertChunks` | Upsert N documentary chunks under `(orgId, scope)`, keyed by `chunk_id` — no embedding required |
+| `chunksV1.searchCorpus` | BM25-only full-text search over chunks, scoped to `(orgId, scope)` — zero embeddings |
 
-### `chunksV1` — BM25-only chunk namespace (zero embeddings)
+### `chunksV1` — BM25-only chunk namespace (zero embeddings), absorbs `@vantageos/corpus` 1:1
 
 Documentary chunk storage isolated by caller-supplied `(orgId, scope)` —
 same "no `ctx.auth`" rationale as `memoriesV1`/`episodesV1`. No embedding
 or AI Gateway call is ever made by this path; search runs entirely inside
 Convex's native full-text index.
 
+`insertChunks` / `searchCorpus` are the EXACT function names, argument
+shape, and result shape (snake_case: `chunk_id`, `section_title`,
+`legal_references`, `source_ref`) as `@vantageos/corpus`'s public contract
+— see "Deprecating `@vantageos/corpus`" below.
+
 ```ts
-await ctx.runMutation(components.dataLake.component.chunksV1.upsert, {
+await ctx.runMutation(components.dataLake.component.chunksV1.insertChunks, {
   orgId: "org-a",
   scope: "droit-du-travail",
   chunks: [
     {
-      chunkId: "chunk-1",
+      chunk_id: "chunk-1",
       text: "Le contrat de travail à durée indéterminée...",
-      sectionTitle: "Article L1221-1",
-      legalReferences: ["Code du travail L1221-1"],
-      sourceRef: "https://legifrance.gouv.fr/L1221-1",
+      section_title: "Article L1221-1",
+      legal_references: ["Code du travail L1221-1"],
+      source_ref: "https://legifrance.gouv.fr/L1221-1",
     },
   ],
 });
 
-const results = await ctx.runQuery(components.dataLake.component.chunksV1.search, {
+const results = await ctx.runQuery(components.dataLake.component.chunksV1.searchCorpus, {
   orgId: "org-a",
   scope: "droit-du-travail",
   query: "période d'essai",
   limit: 10,
 });
+```
+
+## Deprecating `@vantageos/corpus`
+
+`@vantageos/corpus` is ABSORBED into this component's `chunksV1` namespace
+(`insertChunks` / `searchCorpus`, byte-identical contract). New consumers
+should target `@vantageos/data-lake`'s `chunksV1` namespace directly.
+Existing consumers (Thémis droit-du-travail, Talos's
+`vantage-corpus-worker` ingestion worker) migrate by repointing their
+`CONVEX_URL` to a deployment that mounts this component AND re-exposes
+`insertChunks`/`searchCorpus` at the top-level `corpus:insertChunks` /
+`corpus:searchCorpus` HTTP paths their client code already calls — that
+host-app wiring is a separate, deployment-specific follow-up (this package
+ships the Component only).
+
+The prepared deprecation command for whoever runs T4 (publish-side; NOT
+run as part of this change):
+
+```bash
+npm deprecate @vantageos/corpus@">=0.0.0" "Deprecated: absorbed into @vantageos/data-lake's chunksV1 namespace (insertChunks/searchCorpus, byte-identical contract). See https://github.com/vantageos-agency/vantage-peers/tree/main/packages/data-lake#deprecating-vantageoscorpus"
 ```
 
 ## References

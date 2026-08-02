@@ -105,12 +105,18 @@ export default defineSchema({
 		.index("by_namespace_type", ["namespace", "type", "isLatest"]),
 
 	// ── chunks ──────────────────────────────────────────────────────────────────
-	// Convergence KB namespace (VP task k170j3b94dpfwxmrm2qxtwm5p18bqqjm, T2).
-	// Documentary chunk storage: (orgId, scope) isolation, native Convex BM25
-	// full-text search — ZERO embeddings, ZERO external API call. Ported from
-	// @vantageos/corpus's `insertChunks` / `searchCorpus` contract so BU
-	// consumers (Thémis droit-du-travail, Talos corpus) can migrate off
-	// @vantageos/corpus without a data-shape change.
+	// Convergence KB namespace (VP task k170j3b94dpfwxmrm2qxtwm5p18bqqjm T2,
+	// absorbed 1:1 from @vantageos/corpus in k170v3p0sxty10jv8ba9vg45x18bpbeq
+	// T3). Documentary chunk storage: (orgId, scope) isolation, native Convex
+	// BM25 full-text search — ZERO embeddings, ZERO external API call.
+	//
+	// Field names, table shape, and index names are BYTE-IDENTICAL to
+	// @vantageos/corpus's component/schema.ts (snake_case: chunk_id,
+	// section_title, legal_references, source_ref) so BU consumers (Thémis
+	// droit-du-travail, Talos corpus ingestion worker) can migrate off
+	// @vantageos/corpus by repointing CONVEX_URL alone, once the host app
+	// mounts this component and re-exposes `insertChunks` / `searchCorpus` at
+	// the deployment's top level — zero data-shape translation needed.
 	//
 	// This is a THIRD, independent isolation axis alongside `memories.namespace`
 	// and kb's `team/<orgId>/<docId>` convention — orgId + scope is
@@ -119,18 +125,18 @@ export default defineSchema({
 	chunks: defineTable({
 		orgId: v.string(),
 		scope: v.string(),
-		chunkId: v.string(),
+		chunk_id: v.string(),
 		text: v.string(),
-		sectionTitle: v.optional(v.string()),
-		legalReferences: v.array(v.string()),
-		sourceRef: v.string(),
+		section_title: v.optional(v.string()),
+		legal_references: v.array(v.string()),
+		source_ref: v.string(),
 		createdAt: v.number(),
 	})
-		// Upsert + point lookup by (orgId, scope, chunkId) — deny by default,
-		// isolation fields first.
-		.index("by_org_scope_chunkid", ["orgId", "scope", "chunkId"])
 		// Row listing / test assertions scoped to (orgId, scope).
 		.index("by_org_scope", ["orgId", "scope"])
+		// Upsert + point lookup by (orgId, scope, chunk_id) — deny by default,
+		// isolation fields first. Name matches corpus's index 1:1.
+		.index("by_org_scope_chunk", ["orgId", "scope", "chunk_id"])
 		// BM25 full-text search on `text`, filtered inside the search index
 		// itself by (orgId, scope) — NO vector/embedding index on this table.
 		.searchIndex("search_text", {

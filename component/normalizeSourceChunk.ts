@@ -2,21 +2,23 @@
 // (which may carry OBJECT-shaped `legalReferences`/`sourceRef`, as emitted by
 // e.g. vantage-paperasse's droit-du-travail normalize_legi.py /
 // normalize_kali.py / normalize_fiches_travail.py pipelines) to the data-lake
-// `chunksV1.upsert` contract shape (component/chunksV1.ts), whose
-// `legalReferences`/`sourceRef` are STRINGS.
+// `chunksV1.insertChunks` contract shape (component/chunksV1.ts), whose
+// `legal_references`/`source_ref` are STRINGS.
 //
 // Ported from vantage-memory's convex/normalizeSourceChunk.ts (VP task
-// k170j3b94dpfwxmrm2qxtwm5p18bqqjm, T2 — data-lake chunk namespace) onto the
-// @vantageos/data-lake Component conventions: fields renamed
-// chunk_id -> chunkId, section_title -> sectionTitle, legal_references ->
-// legalReferences, source_ref -> sourceRef, to match this Component's
-// camelCase convention (memoriesV1.ts / episodesV1.ts / schema.ts). Logic is
-// unchanged. Zero I/O, zero Convex import — a domain loader calls this before
-// `chunksV1.upsert`, never after.
+// k170j3b94dpfwxmrm2qxtwm5p18bqqjm, T2 — data-lake chunk namespace), then
+// reconciled in T3 (k170v3p0sxty10jv8ba9vg45x18bpbeq): the OUTPUT shape is
+// now snake_case (chunk_id, section_title, legal_references, source_ref) to
+// match chunksV1.insertChunks's byte-identical @vantageos/corpus contract.
+// The INPUT `SourceChunk` type is UNCHANGED (still camelCase) — it
+// represents the upstream domain pipeline's own field convention, a
+// separate boundary from the data-lake contract this module maps onto.
+// Logic is unchanged. Zero I/O, zero Convex import — a domain loader calls
+// this before `chunksV1.insertChunks`, never after.
 //
 // Mapping contract:
 //
-//   legalReferences: string[]
+//   legal_references: string[]
 //     - a string entry passes through unchanged.
 //     - an object entry {code, article_id, article_cid, text} maps to the
 //       human-readable citation `"${code} ${text}".trim()` when at least
@@ -25,18 +27,18 @@
 //       four fields non-empty is a malformed source chunk and is refused
 //       loudly (never silently coerced to an empty string).
 //
-//   sourceRef: string
+//   source_ref: string
 //     - a string passes through unchanged.
 //     - an object {pubId, url, repo, licence, date_maj} maps to `url` (the
 //       canonical citable provenance link) when present, else `pubId`.
 //       An object with neither `url` nor `pubId` is refused loudly.
 
 export type NormalizedChunk = {
-	chunkId: string;
+	chunk_id: string;
 	text: string;
-	sectionTitle?: string;
-	legalReferences: string[];
-	sourceRef: string;
+	section_title?: string;
+	legal_references: string[];
+	source_ref: string;
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -105,15 +107,15 @@ export type SourceChunk = {
 
 export function normalizeSourceChunk(sourceChunk: SourceChunk): NormalizedChunk {
 	const normalized: NormalizedChunk = {
-		chunkId: sourceChunk.chunkId,
+		chunk_id: sourceChunk.chunkId,
 		text: sourceChunk.text,
-		legalReferences: sourceChunk.legalReferences.map((entry, index) =>
+		legal_references: sourceChunk.legalReferences.map((entry, index) =>
 			normalizeLegalReference(entry, index),
 		),
-		sourceRef: normalizeSourceRefValue(sourceChunk.sourceRef),
+		source_ref: normalizeSourceRefValue(sourceChunk.sourceRef),
 	};
 	if (typeof sourceChunk.sectionTitle === "string") {
-		normalized.sectionTitle = sourceChunk.sectionTitle;
+		normalized.section_title = sourceChunk.sectionTitle;
 	}
 	return normalized;
 }
