@@ -1,5 +1,56 @@
 # @vantageos/data-lake — Changelog
 
+## 0.3.3 — 2026-08-03 — fix: component schema never registered at install (packaging defect)
+
+**Root cause (confirmed by Talos on `dashing-ermine-394` with `--verbose`
+bundle-plan capture)**: `schemaChange.schemaIds.dataLake = null`,
+`componentDiffs.dataLake.schemaDiff = null`, `indexDiff.added_indexes = []`
+— zero `chunks` indexes deployed, including `by_org_scope_chunk`, even
+though `component/schema.ts` declared them. Runtime consequence:
+`Index chunks.by_org_scope_chunk not found` on `insertChunks`/`searchCorpus`.
+
+**Mechanism** (`node_modules/convex/dist/cli.bundle.cjs`,
+`bundleImplementations()`, ~L123320-123328): for each component, Convex's
+bundler resolves that component's schema with
+`ctx.fs.exists(path.resolve(resolvedPath, "schema.ts"))` where
+`resolvedPath = dirname(<that component's convex.config.ts>)` — an EXACT,
+NON-RECURSIVE sibling lookup. In 0.3.1/0.3.2, `convex.config.ts` lived at
+the package root while `schema.ts` (and every function file) lived in
+`component/`. `npm pack` correctly included `component/schema.ts` in the
+tarball (verified: file present, `chunks` table + `by_org_scope_chunk`
+index text both present in the packed file) — the defect was NOT missing
+files, it was that the schema and the component definition were never
+SIBLINGS on disk, so the bundler looked in the wrong directory and got
+`schema = null`. Functions still bundled fine because `entryPoints()` walks
+`resolvedPath` recursively for `.ts` function files, but `bundleSchema()`
+does not.
+
+**Fix**: moved `convex.config.ts` into `component/` (`git mv
+convex.config.ts component/convex.config.ts`), so `component/` is now this
+package's single self-contained component directory: `convex.config.ts`,
+`schema.ts`, every function file, and `_generated/` are all siblings, which
+is exactly the directory the bundler resolves and searches. Updated
+`package.json` `main`/`exports` to point at
+`./component/convex.config.ts`, and dropped the now-stale top-level
+`convex.config.ts` entry from `files` (already covered by the existing
+`component/**/*.ts` glob). Org isolation (`by_org_scope_chunk`,
+deny-by-default on missing `orgId`) is unchanged — this release touches
+packaging only, zero schema/function logic edited.
+
+**Static proof** (`npm run verify-tarball`, `scripts/verify-tarball.mjs`,
+new in this release): packs the tarball, extracts it, and asserts
+`component/convex.config.ts` and `component/schema.ts` are siblings inside
+the tarball, and that the packed `schema.ts` contains both the `chunks`
+table and the `by_org_scope_chunk` index declaration. RED against 0.3.2
+(`ENOENT` on `component/convex.config.ts` — file wasn't there, confirming
+the sibling defect), GREEN against 0.3.3 (all 4 checks pass).
+
+25/25 vitest tests green (unchanged — these already tested the isolation
+logic in-process via `convex-test` against `component/schema.ts` directly,
+so they never exercised the packaging path; the packaging defect was only
+observable via a real bundle-plan capture or the new tarball-inspection
+script).
+
 ## 0.3.2 — 2026-08-02 — reconstituted source + chunk namespace + corpus contract + FSL license fix
 
 Consolidated release covering four T4 sub-steps landed on `main`:
