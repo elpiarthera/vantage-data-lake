@@ -1,6 +1,6 @@
 {
   "name": "@vantageos/data-lake",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Convex Component — RAG + embeddings + intake générique (memories, episodes, search) — substrate data-lake for VantagePeers, Vantage Immo, and downstream BUs",
   "keywords": [
     "convex-component",
@@ -17,13 +17,12 @@
     "directory": "packages/data-lake"
   },
   "type": "module",
-  "main": "./convex.config.ts",
+  "main": "./component/convex.config.ts",
   "exports": {
-    ".": "./convex.config.ts",
-    "./convex.config.js": "./convex.config.ts"
+    ".": "./component/convex.config.ts",
+    "./convex.config.js": "./component/convex.config.ts"
   },
   "files": [
-    "convex.config.ts",
     "component/**/*.ts",
     "component/**/*.md",
     "!component/**/*.test.ts",
