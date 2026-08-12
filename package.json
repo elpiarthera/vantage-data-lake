@@ -1,6 +1,6 @@
 {
   "name": "@vantageos/data-lake",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Convex Component — RAG + embeddings + intake générique (memories, episodes, search) — substrate data-lake for VantagePeers, Vantage Immo, and downstream BUs",
   "keywords": [
     "convex-component",
@@ -13,8 +13,7 @@
   "license": "FSL-1.1-Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vantageos-agency/vantage-peers.git",
-    "directory": "packages/data-lake"
+    "url": "https://github.com/elpiarthera/vantage-data-lake.git"
   },
   "type": "module",
   "main": "./component/convex.config.ts",

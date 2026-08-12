@@ -1,5 +1,18 @@
 # @vantageos/data-lake — Changelog
 
+## 0.3.4 — 2026-08-12 — fix: repository.url pointed at a repo that never contained this component (dead pointer)
+
+The published `0.3.3` declared `repository.url = github.com/vantageos-agency/vantage-peers`
+(+ `directory: packages/data-lake`) — a repo that has never held this component. Anyone
+following the pointer to find the source hit nothing and stalled: today it sent an
+orchestrator searching the wrong tree, halted the KB convergence mission, and left 87k
+droit-du-travail chunks waiting behind it. The true source is this repo
+(`elpiarthera/vantage-data-lake`), component at the root. Fixed `repository.url` to point
+here and dropped the stale `directory` field. Metadata-only; a fix only exists once the
+registry SERVES it, so this ships as `0.3.4` and `npm view … repository.url` is re-read
+(cache-busted) after publish. Part of the fleet-wide `@vantageos/*` dead-pointer sweep
+(VP task `k171z37h212y1p3d7y5pks4ztx8cb7hp`).
+
 ## 0.3.3 — 2026-08-03 — fix: component schema never registered at install (packaging defect)
 
 **Root cause (confirmed by Talos on `dashing-ermine-394` with `--verbose`
