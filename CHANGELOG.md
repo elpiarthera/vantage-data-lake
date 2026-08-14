@@ -1,5 +1,14 @@
 # @vantageos/data-lake — Changelog
 
+## 0.4.0 — 2026-08-14 — feat: countChunks — in-base row count for (orgId, scope)
+
+Adds `countChunks`, a component query returning the row count for a given
+`(orgId, scope)` without reading rows back client-side. Backward-compatible
+addition — no schema or existing-export change — hence a MINOR bump.
+
+Merged PR #8 (`feat/countchunks-native-count`, `cd8c018` → `8bc36d68` on
+`main`). Reviewed and APPROVED by Eta. Task: k17bkwr014f43zmp5hkz2777rx8cfwt0.
+
 ## 0.3.3 — 2026-08-03 — fix: component schema never registered at install (packaging defect)
 
 **Root cause (confirmed by Talos on `dashing-ermine-394` with `--verbose`
