@@ -33,6 +33,9 @@
   },
   "private": false,
   "scripts": {
+    "typecheck": "tsc --noEmit -p .",
+    "pretest": "npm run typecheck",
+    "prepublishOnly": "npm run typecheck",
     "verify-tarball": "node scripts/verify-tarball.mjs",
     "test": "vitest run"
   },
