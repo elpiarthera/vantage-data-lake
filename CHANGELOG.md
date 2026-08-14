@@ -1,5 +1,29 @@
 # @vantageos/data-lake — Changelog
 
+## 0.4.2 — 2026-08-14 — fix: tsc gate + 50 typecheck errors (missing `@convex-dev/rag` dependency)
+
+**Root cause.** `component/searchV1.ts` and `component/convex.config.ts` import
+`@convex-dev/rag` / `@convex-dev/rag/convex.config.js`, but the package was never declared
+in `package.json` — neither `dependencies` nor `devDependencies`. Since this component ships
+TypeScript SOURCE (consumer compiles it), the missing module resolution produced 2× TS2307
+("Cannot find module") which then cascaded into 48 more errors downstream (implicit-`any`
+params, `possibly null`, properties absent from the fallback `{}` type) as every value
+touching the RAG return types lost its real shape. `npx tsc --noEmit -p .` on `0.4.1`: 50
+errors. Fix: add `"@convex-dev/rag": "^0.7.5"` to `dependencies` (not `peerDependencies` —
+`convex` stays the only peer dep; `rag` composes transitively through this package's own
+`convex.config.ts`, so it must resolve the same way any nested Convex component dependency
+does). Zero errors post-fix, zero other source lines touched.
+
+**Gate added — was previously ZERO enforcement.** `package.json` `scripts` had no
+`typecheck` and no CI workflow existed (`.github/workflows/` was empty) — the 50-error state
+shipped in `0.4.0`/`0.4.1`'s published tarball undetected. Added
+`"typecheck": "tsc --noEmit -p ."`, wired to `pretest` (so `npm test` always runs it first)
+and `prepublishOnly` (so `npm publish` cannot skip it). Captured RED against the pre-fix tree
+(50 errors, exit 2) before applying the dependency fix, to prove the gate bites rather than
+being laid on an already-green tree.
+
+Task: `k173haa3qpkx44ak1430gexz2d8cfqtw`.
+
 ## 0.4.1 — 2026-08-14 — fix: countChunks paginated (0.4.0's single `.collect()` raises at scale) + repository pointer correction
 
 **countChunks paginated (VP task `k171tdmy8xwx8ss0yckae0pdbn8cfxad`).** Themis PROVED on an

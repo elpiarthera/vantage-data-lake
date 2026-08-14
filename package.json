@@ -1,6 +1,6 @@
 {
   "name": "@vantageos/data-lake",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Convex Component — RAG + embeddings + intake générique (memories, episodes, search) — substrate data-lake for VantagePeers, Vantage Immo, and downstream BUs",
   "keywords": [
     "convex-component",
@@ -45,5 +45,8 @@
     "convex-test": "^0.0.44",
     "typescript": "^5.6.3",
     "vitest": "^2.1.9"
+  },
+  "dependencies": {
+    "@convex-dev/rag": "^0.7.5"
   }
 }
