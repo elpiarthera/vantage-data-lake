@@ -175,4 +175,31 @@ export default defineSchema({
 		// Upsert + point lookup by (orgId, scope, document_id) — deny by
 		// default, isolation fields first. Mirrors chunks' by_org_scope_chunk.
 		.index("by_org_scope_document", ["orgId", "scope", "document_id"]),
+
+	// ── chunk_scope_counts / document_scope_counts ─────────────────────────────
+	// Write-time counters for corpus-completeness reads. A Convex COMPONENT
+	// forbids `.paginate()` — "paginate() is only supported in the app" —
+	// which raises on every scope, empty or not (measured by Talos on prod
+	// proficient-rabbit-316 and dev dashing-ermine-394; call sites confirmed
+	// by Pi). `.collect()` is likewise banned here (0.4.1 already proved it
+	// raises past ~16MB). The fix is structural, not a bigger page size: never
+	// scan the data table for a count. Each (orgId, scope) pair owns exactly
+	// one counter row here, maintained by the insert/delete mutation that
+	// changes the underlying table — countChunks/countDocuments become a
+	// single indexed point lookup, O(1) regardless of corpus size.
+	chunk_scope_counts: defineTable({
+		org_id: v.string(),
+		scope: v.string(),
+		count: v.number(),
+	})
+		// Isolation fields first, deny by default — same convention as
+		// chunks/documents' by_org_scope indexes.
+		.index("by_org_scope", ["org_id", "scope"]),
+
+	document_scope_counts: defineTable({
+		org_id: v.string(),
+		scope: v.string(),
+		count: v.number(),
+	})
+		.index("by_org_scope", ["org_id", "scope"]),
 });

@@ -16,6 +16,7 @@
 
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server.js";
+import type { MutationCtx } from "./_generated/server.js";
 
 const documentInputValidator = v.object({
 	document_id: v.string(),
@@ -36,6 +37,50 @@ function requireOrgScope(orgId: string, scope: string): void {
 			"scope is required — deny by default, refusing an unscoped documents write/read.",
 		);
 	}
+}
+
+// incrementDocumentScopeCount / decrementDocumentScopeCount — write-time
+// counter maintenance for `document_scope_counts`. Mirrors chunksV1's
+// incrementChunkScopeCount/decrementChunkScopeCount 1:1: get-then-patch via
+// `by_org_scope`, called ONLY from the genuine-insert / genuine-delete
+// branches so idempotency lives at the call site.
+async function incrementDocumentScopeCount(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("document_scope_counts")
+		.withIndex("by_org_scope", (q) =>
+			q.eq("org_id", orgId).eq("scope", scope),
+		)
+		.unique();
+	if (row === null) {
+		await ctx.db.insert("document_scope_counts", {
+			org_id: orgId,
+			scope,
+			count: 1,
+		});
+	} else {
+		await ctx.db.patch(row._id, { count: row.count + 1 });
+	}
+}
+
+// decrementDocumentScopeCount — never below 0; a missing counter row is
+// treated as already-0 (no-op), never an error.
+async function decrementDocumentScopeCount(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("document_scope_counts")
+		.withIndex("by_org_scope", (q) =>
+			q.eq("org_id", orgId).eq("scope", scope),
+		)
+		.unique();
+	if (row === null) return;
+	await ctx.db.patch(row._id, { count: Math.max(0, row.count - 1) });
 }
 
 // insertDocuments — UPSERTS N documents of the common schema under
@@ -87,6 +132,10 @@ export const insertDocuments = mutation({
 					legal_references: document.legal_references,
 					createdAt: now,
 				});
+				// Genuine-insert branch ONLY — the `existing !== null` branch
+				// above (re-upsert) never reaches here, so the counter is
+				// idempotent on repeat ingestion of the same document_id.
+				await incrementDocumentScopeCount(ctx, args.orgId, args.scope);
 			}
 		}
 		return args.documents.length;
@@ -138,15 +187,52 @@ export const getDocument = query({
 	},
 });
 
-// countDocuments — the EXACT number of `documents` rows for (orgId, scope),
-// READ FROM THE DATABASE, PAGED (same strategy as 0.4.1's countChunks fix —
-// VP task k171tdmy8xwx8ss0yckae0pdbn8cfxad): a single `.collect()` raises
-// "Too many bytes read in a single function execution" past ~16MB and never
-// truncates. This reads bounded pages via `by_org_scope_document` and
-// accumulates a running scalar — no single function execution ever reads
-// more than one page's worth of bytes regardless of scope size.
-const COUNT_DOCUMENTS_PAGE_SIZE = 500;
+// deleteDocument — removes a single document row by (orgId, scope,
+// document_id) via the `by_org_scope_document` index (isolation fields
+// first, deny by default). Decrements `document_scope_counts` ONLY when a
+// row actually existed and was deleted — deleting an already-absent
+// document_id is a no-op for both the table and the counter. No delete
+// mutation existed on this table prior to this change (insertDocuments was
+// upsert-only); this is the first write path that removes a documents row,
+// and the only decrement call site.
+export const deleteDocument = mutation({
+	args: {
+		orgId: v.string(),
+		scope: v.string(),
+		document_id: v.string(),
+	},
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		requireOrgScope(args.orgId, args.scope);
+		const existing = await ctx.db
+			.query("documents")
+			.withIndex("by_org_scope_document", (q) =>
+				q
+					.eq("orgId", args.orgId)
+					.eq("scope", args.scope)
+					.eq("document_id", args.document_id),
+			)
+			.unique();
+		if (existing === null) return false;
+		await ctx.db.delete(existing._id);
+		await decrementDocumentScopeCount(ctx, args.orgId, args.scope);
+		return true;
+	},
+});
 
+// countDocuments — the EXACT number of `documents` rows for (orgId, scope),
+// READ FROM THE WRITE-TIME COUNTER (`document_scope_counts`), NEVER a scan
+// of the `documents` table itself.
+//
+// A Convex COMPONENT forbids `.paginate()` outright — "paginate() is only
+// supported in the app" — raised on every scope, empty or not (measured by
+// Talos on prod proficient-rabbit-316 and dev dashing-ermine-394; call sites
+// confirmed by Pi). This rebuild removes ALL scanning from the count path:
+// `insertDocuments` (genuine-insert branch only) and `deleteDocument`
+// maintain `document_scope_counts` at write time, and this reads that
+// single counter row via the `by_org_scope` index — one indexed point
+// lookup, O(1) regardless of corpus size, no `.paginate()`, no
+// `.collect()`, no `.take()`-loop.
 export const countDocuments = query({
 	args: {
 		orgId: v.string(),
@@ -156,21 +242,12 @@ export const countDocuments = query({
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
 
-		let total = 0;
-		let cursor: string | null = null;
-		while (true) {
-			const page = await ctx.db
-				.query("documents")
-				.withIndex("by_org_scope_document", (q) =>
-					q.eq("orgId", args.orgId).eq("scope", args.scope),
-				)
-				.paginate({ cursor, numItems: COUNT_DOCUMENTS_PAGE_SIZE });
-			total += page.page.length;
-			if (page.isDone) {
-				break;
-			}
-			cursor = page.continueCursor;
-		}
-		return total;
+		const row = await ctx.db
+			.query("document_scope_counts")
+			.withIndex("by_org_scope", (q) =>
+				q.eq("org_id", args.orgId).eq("scope", args.scope),
+			)
+			.unique();
+		return row === null ? 0 : row.count;
 	},
 });

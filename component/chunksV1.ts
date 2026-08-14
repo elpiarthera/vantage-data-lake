@@ -35,6 +35,7 @@
 
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server.js";
+import type { MutationCtx } from "./_generated/server.js";
 
 const chunkInputValidator = v.object({
 	chunk_id: v.string(),
@@ -55,6 +56,51 @@ function requireOrgScope(orgId: string, scope: string): void {
 			"scope is required — deny by default, refusing an unscoped chunks write/read.",
 		);
 	}
+}
+
+// incrementChunkScopeCount / decrementChunkScopeCount — write-time counter
+// maintenance for `chunk_scope_counts`. Get-then-patch via the
+// `by_org_scope` index (isolation fields first). Called ONLY from the
+// genuine-insert branch (never the update/upsert branch) so a re-upsert of
+// an existing chunk_id never moves the counter — idempotency lives at the
+// call site (insertChunks' existing new-vs-existing branch), not here.
+async function incrementChunkScopeCount(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("chunk_scope_counts")
+		.withIndex("by_org_scope", (q) =>
+			q.eq("org_id", orgId).eq("scope", scope),
+		)
+		.unique();
+	if (row === null) {
+		await ctx.db.insert("chunk_scope_counts", {
+			org_id: orgId,
+			scope,
+			count: 1,
+		});
+	} else {
+		await ctx.db.patch(row._id, { count: row.count + 1 });
+	}
+}
+
+// decrementChunkScopeCount — never below 0; a missing counter row is treated
+// as already-0 (no-op), never an error.
+async function decrementChunkScopeCount(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("chunk_scope_counts")
+		.withIndex("by_org_scope", (q) =>
+			q.eq("org_id", orgId).eq("scope", scope),
+		)
+		.unique();
+	if (row === null) return;
+	await ctx.db.patch(row._id, { count: Math.max(0, row.count - 1) });
 }
 
 // insertChunks — UPSERTS N chunks of the common schema under (orgId, scope),
@@ -109,9 +155,46 @@ export const insertChunks = mutation({
 					source_ref: chunk.source_ref,
 					createdAt: now,
 				});
+				// Genuine-insert branch ONLY — a re-upsert (the `existing !==
+				// null` branch above) never reaches here, so the counter is
+				// idempotent on repeat ingestion of the same chunk_id.
+				await incrementChunkScopeCount(ctx, args.orgId, args.scope);
 			}
 		}
 		return args.chunks.length;
+	},
+});
+
+// deleteChunk — removes a single chunk row by (orgId, scope, chunk_id) via
+// the `by_org_scope_chunk` index (isolation fields first, deny by default).
+// Decrements `chunk_scope_counts` ONLY when a row actually existed and was
+// deleted — deleting an already-absent chunk_id is a no-op for both the
+// table and the counter. No delete mutation existed on this table prior to
+// this change (insertChunks was upsert-only); this is the first write path
+// that removes a chunks row, so it is also the first (and only) decrement
+// call site.
+export const deleteChunk = mutation({
+	args: {
+		orgId: v.string(),
+		scope: v.string(),
+		chunk_id: v.string(),
+	},
+	returns: v.boolean(),
+	handler: async (ctx, args) => {
+		requireOrgScope(args.orgId, args.scope);
+		const existing = await ctx.db
+			.query("chunks")
+			.withIndex("by_org_scope_chunk", (q) =>
+				q
+					.eq("orgId", args.orgId)
+					.eq("scope", args.scope)
+					.eq("chunk_id", args.chunk_id),
+			)
+			.unique();
+		if (existing === null) return false;
+		await ctx.db.delete(existing._id);
+		await decrementChunkScopeCount(ctx, args.orgId, args.scope);
+		return true;
 	},
 });
 
@@ -169,31 +252,23 @@ export const searchCorpus = query({
 });
 
 // countChunks — the EXACT number of `chunks` rows for (orgId, scope), READ
-// FROM THE DATABASE. This is deliberately NOT `insertChunks`'s return value:
-// that number is "chunks processed by THIS call" (what was SENT), which is
-// unusable as a corpus-completeness proof (derive-never-type: a value a tool
-// can read is derived, never typed/assumed from a prior call's own report).
-// countChunks derives the count from the current, persisted table state —
-// the only thing a completeness gate can trust.
+// FROM THE WRITE-TIME COUNTER (`chunk_scope_counts`), NEVER a scan of the
+// `chunks` table itself.
 //
-// Filtered via the `by_org_scope_chunk` index (["orgId","scope","chunk_id"],
-// isolation fields first) — NEVER an unfiltered/global scan. Same
-// requireOrgScope guard as insertChunks/searchCorpus (deny by default).
+// A Convex COMPONENT forbids `.paginate()` outright — "paginate() is only
+// supported in the app" — raised on every scope, empty or not (measured by
+// Talos on prod proficient-rabbit-316 and dev dashing-ermine-394; call sites
+// confirmed by Pi). The prior 0.4.1 fix paged around `.collect()`'s ~16MB
+// cap but still called `.paginate()`, which the component runtime rejects
+// unconditionally — the 32/32 green suite was a FALSE green because
+// convex-test permits `.paginate()` where the component runtime forbids it.
 //
-// PAGED, never a single `.collect()` (fixed in 0.4.1 — VP task
-// k171tdmy8xwx8ss0yckae0pdbn8cfxad): Themis proved on an isolated deployment
-// (same platform version as prod) that `.collect()` RAISES "Too many bytes
-// read in a single function execution (limit: 16777216 bytes)" past ~16MB
-// and NEVER truncates — on the real scope (144283 rows, each far larger
-// than her 500-byte padding) a single collect raises before returning. The
-// caller's contract is unchanged: still returns a plain `number`, still the
-// exact total, still bounded by the same `by_org_scope_chunk` index prefix —
-// only the READ STRATEGY changes, from one unbounded collect to repeated
-// bounded pages accumulated in-memory as a running scalar (never buffering
-// the rows themselves), so no single function execution ever reads more
-// than one page's worth of bytes regardless of how large the scope is.
-const COUNT_CHUNKS_PAGE_SIZE = 500;
-
+// This rebuild removes ALL scanning from the count path: `insertChunks`
+// (genuine-insert branch only) and `deleteChunk` maintain
+// `chunk_scope_counts` at write time, and this reads that single counter
+// row via the `by_org_scope` index — one indexed point lookup, O(1)
+// regardless of corpus size, no `.paginate()`, no `.collect()`, no
+// `.take()`-loop.
 export const countChunks = query({
 	args: {
 		orgId: v.string(),
@@ -203,21 +278,12 @@ export const countChunks = query({
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
 
-		let total = 0;
-		let cursor: string | null = null;
-		while (true) {
-			const page = await ctx.db
-				.query("chunks")
-				.withIndex("by_org_scope_chunk", (q) =>
-					q.eq("orgId", args.orgId).eq("scope", args.scope),
-				)
-				.paginate({ cursor, numItems: COUNT_CHUNKS_PAGE_SIZE });
-			total += page.page.length;
-			if (page.isDone) {
-				break;
-			}
-			cursor = page.continueCursor;
-		}
-		return total;
+		const row = await ctx.db
+			.query("chunk_scope_counts")
+			.withIndex("by_org_scope", (q) =>
+				q.eq("org_id", args.orgId).eq("scope", args.scope),
+			)
+			.unique();
+		return row === null ? 0 : row.count;
 	},
 });
