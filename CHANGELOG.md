@@ -1,5 +1,31 @@
 # @vantageos/data-lake — Changelog
 
+## 0.4.1 — 2026-08-14 — fix: countChunks paginated (0.4.0's single `.collect()` raises at scale) + repository pointer correction
+
+**countChunks paginated (VP task `k171tdmy8xwx8ss0yckae0pdbn8cfxad`).** Themis PROVED on an
+isolated Convex deployment (same platform version as prod) that `0.4.0`'s `countChunks`
+(a single `.collect()` over the `by_org_scope_chunk` index prefix) RAISES "Too many bytes
+read in a single function execution (limit: 16777216 bytes)" past ~16MB and NEVER truncates.
+On the real target scope (144283 rows, each far larger than her 500-byte padding), a single
+collect raises before returning — `countChunks` as published could not make the
+completeness count it exists for. Fixed by accumulating the row count over pages
+(`.paginate()` cursor loop, 500 rows/page) inside the function instead of a single collect.
+The caller's contract is UNCHANGED — still the same `by_org_scope_chunk` index, same
+`requireOrgScope` guard, still returns a plain `number`, still the exact total; only the
+internal read strategy changed. Proven by a new test that inserts 2.5x the internal page
+size (1250 rows) into one `(orgId, scope)` and asserts the exact total, forcing accumulation
+across at least two page boundaries.
+
+**Repository pointer correction (folds PR #7).** `0.4.0`'s `package.json` still carried the
+dead `repository.url` (`github.com/vantageos-agency/vantage-peers.git` + a `directory` field)
+that PR #7 diagnosed and fixed for `0.3.4` — that PR's branch walked the manifest version
+backwards (`0.3.3` → `0.3.4`, behind the already-published `0.4.0`) so it was never merged as
+a branch; its 3-line content is folded in here instead. `repository.url` now points at the
+true source, `https://github.com/elpiarthera/vantage-data-lake.git`, with the stale
+`directory` field dropped.
+
+Task: `k171tdmy8xwx8ss0yckae0pdbn8cfxad`.
+
 ## 0.4.0 — 2026-08-14 — feat: countChunks — in-base row count for (orgId, scope)
 
 Adds `countChunks`, a component query returning the row count for a given

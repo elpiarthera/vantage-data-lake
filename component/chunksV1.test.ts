@@ -474,4 +474,49 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 			}),
 		).rejects.toThrow(/scope/i);
 	});
+
+	// Multi-page accumulation proof (0.4.1 — VP task
+	// k171tdmy8xwx8ss0yckae0pdbn8cfxad): countChunks's internal page size is
+	// 500 rows/page. Inserting 2.5x that (1250 rows) into ONE (orgId, scope)
+	// forces the paged read to cross AT LEAST two page boundaries before
+	// countChunks can return — a first-page-only or single-`.collect()`
+	// implementation would either under-report (first page only) or, on a
+	// real deployment past the byte ceiling, raise instead of returning.
+	//
+	// RED (recorded verbatim, captured against a first-page-only stub
+	// implementation of countChunks BEFORE the paginate-cursor-loop landed):
+	//
+	//   FAIL  component/chunksV1.test.ts > countChunks (in-base count...)
+	//     > countChunks accumulates the EXACT total across multiple pages
+	//   AssertionError: expected 500 to be 1250
+	//    + Expected: 1250
+	//    - Actual:   500
+	//   -- a first-page-only read returned only the first
+	//   COUNT_CHUNKS_PAGE_SIZE rows and stopped, proving the paging loop
+	//   (not just a single page) is load-bearing for exactness at scale.
+	test("countChunks accumulates the EXACT total across multiple pages (2.5x page size, one scope)", async () => {
+		const t = createT();
+
+		const PAGE_SIZE = 500;
+		const N = Math.floor(PAGE_SIZE * 2.5); // 1250 — crosses >= 2 page boundaries
+		const chunks = Array.from({ length: N }, (_, i) => ({
+			chunk_id: `paged-${i}`,
+			text: `Paged accumulation chunk number ${i}.`,
+			legal_references: [],
+			source_ref: `src/paged-${i}`,
+		}));
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-paged",
+			scope: "paged-scope",
+			chunks,
+		});
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-paged",
+			scope: "paged-scope",
+		});
+
+		expect(count).toBe(N);
+	});
 });
