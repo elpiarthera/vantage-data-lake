@@ -167,3 +167,34 @@ export const searchCorpus = query({
 		}));
 	},
 });
+
+// countChunks — the EXACT number of `chunks` rows for (orgId, scope), READ
+// FROM THE DATABASE. This is deliberately NOT `insertChunks`'s return value:
+// that number is "chunks processed by THIS call" (what was SENT), which is
+// unusable as a corpus-completeness proof (derive-never-type: a value a tool
+// can read is derived, never typed/assumed from a prior call's own report).
+// countChunks derives the count from the current, persisted table state —
+// the only thing a completeness gate can trust.
+//
+// Filtered via the `by_org_scope_chunk` index (["orgId","scope","chunk_id"],
+// isolation fields first) — NEVER an unfiltered/global scan. `.collect()` on
+// an equality-only prefix (orgId, scope) is bounded by the isolation scope's
+// own row count, not the whole table; same requireOrgScope guard as
+// insertChunks/searchCorpus (deny by default).
+export const countChunks = query({
+	args: {
+		orgId: v.string(),
+		scope: v.string(),
+	},
+	returns: v.number(),
+	handler: async (ctx, args) => {
+		requireOrgScope(args.orgId, args.scope);
+		const rows = await ctx.db
+			.query("chunks")
+			.withIndex("by_org_scope_chunk", (q) =>
+				q.eq("orgId", args.orgId).eq("scope", args.scope),
+			)
+			.collect();
+		return rows.length;
+	},
+});

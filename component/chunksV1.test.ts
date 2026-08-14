@@ -283,3 +283,195 @@ describe("component/chunksV1.ts — insertChunks + searchCorpus (BM25-only, no e
 		expect(row.scope).toBe("droit-du-travail");
 	});
 });
+
+// ── countChunks — in-base count, read FROM THE DATABASE, never from what was
+// sent (derive-never-type: insertChunks's return is "chunks processed by this
+// call", NOT a corpus-completeness proof). countChunks answers "how many rows
+// actually exist for (orgId, scope) right now", filtered via the same
+// by_org_scope_chunk index insertChunks/searchCorpus already use — never an
+// unfiltered/global scan.
+//
+// RED (recorded verbatim, captured against this repo BEFORE
+// component/chunksV1.ts exported countChunks):
+//
+//   FAIL  component/chunksV1.test.ts [ component/chunksV1.test.ts ]
+//   TypeError: api.chunksV1.countChunks is not a function
+//   -- every test in this describe block failed at call time, because
+//   countChunks did not exist on chunksV1 yet.
+describe("component/chunksV1.ts — countChunks (in-base count, isolation + exactness proof)", () => {
+	test("countChunks(A) never counts B's rows — isolation across scope, same orgId", async () => {
+		const t = createT();
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-count",
+			scope: "scope-a",
+			chunks: [
+				{
+					chunk_id: "count-a-1",
+					text: "Chunk scope A, one.",
+					legal_references: [],
+					source_ref: "src/a-1",
+				},
+				{
+					chunk_id: "count-a-2",
+					text: "Chunk scope A, two.",
+					legal_references: [],
+					source_ref: "src/a-2",
+				},
+			],
+		});
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-count",
+			scope: "scope-b",
+			chunks: [
+				{
+					chunk_id: "count-b-1",
+					text: "Chunk scope B, one.",
+					legal_references: [],
+					source_ref: "src/b-1",
+				},
+			],
+		});
+
+		const countA = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-count",
+			scope: "scope-a",
+		});
+		const countB = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-count",
+			scope: "scope-b",
+		});
+
+		expect(countA).toBe(2);
+		expect(countB).toBe(1);
+	});
+
+	test("countChunks(A) never counts B's rows — isolation across orgId, same scope", async () => {
+		const t = createT();
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-count-x",
+			scope: "shared-scope",
+			chunks: [
+				{
+					chunk_id: "x-1",
+					text: "Org X chunk one.",
+					legal_references: [],
+					source_ref: "src/x-1",
+				},
+				{
+					chunk_id: "x-2",
+					text: "Org X chunk two.",
+					legal_references: [],
+					source_ref: "src/x-2",
+				},
+				{
+					chunk_id: "x-3",
+					text: "Org X chunk three.",
+					legal_references: [],
+					source_ref: "src/x-3",
+				},
+			],
+		});
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-count-y",
+			scope: "shared-scope",
+			chunks: [
+				{
+					chunk_id: "y-1",
+					text: "Org Y chunk one.",
+					legal_references: [],
+					source_ref: "src/y-1",
+				},
+			],
+		});
+
+		const countX = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-count-x",
+			scope: "shared-scope",
+		});
+		const countY = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-count-y",
+			scope: "shared-scope",
+		});
+
+		expect(countX).toBe(3);
+		expect(countY).toBe(1);
+	});
+
+	test("exactness — countChunks == N inserted, and an idempotent re-upsert of an existing chunk_id leaves the count UNCHANGED", async () => {
+		const t = createT();
+
+		const N = 5;
+		const chunks = Array.from({ length: N }, (_, i) => ({
+			chunk_id: `exact-${i}`,
+			text: `Exactness chunk number ${i}.`,
+			legal_references: [],
+			source_ref: `src/exact-${i}`,
+		}));
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-exact",
+			scope: "exact-scope",
+			chunks,
+		});
+
+		const firstCount = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-exact",
+			scope: "exact-scope",
+		});
+		expect(firstCount).toBe(N);
+
+		// Re-upsert ONE existing chunk_id (patch-in-place, per insertChunks'
+		// own idempotence contract) -- count must stay N, never N+1.
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-exact",
+			scope: "exact-scope",
+			chunks: [
+				{
+					chunk_id: "exact-0",
+					text: "Exactness chunk number 0 — amended text on re-ingest.",
+					legal_references: [],
+					source_ref: "src/exact-0",
+				},
+			],
+		});
+
+		const secondCount = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-exact",
+			scope: "exact-scope",
+		});
+		expect(secondCount).toBe(N);
+	});
+
+	test("empty scope — countChunks on a non-existent (orgId, scope) returns 0, no error", async () => {
+		const t = createT();
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-never-seeded",
+			scope: "scope-never-seeded",
+		});
+
+		expect(count).toBe(0);
+	});
+
+	test("countChunks refuses an empty orgId — deny by default, same guard as insertChunks/searchCorpus", async () => {
+		const t = createT();
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "",
+				scope: "some-scope",
+			}),
+		).rejects.toThrow(/orgId/i);
+	});
+
+	test("countChunks refuses an empty scope — deny by default, same guard as insertChunks/searchCorpus", async () => {
+		const t = createT();
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-count",
+				scope: "",
+			}),
+		).rejects.toThrow(/scope/i);
+	});
+});
