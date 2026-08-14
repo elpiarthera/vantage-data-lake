@@ -177,10 +177,23 @@ export const searchCorpus = query({
 // the only thing a completeness gate can trust.
 //
 // Filtered via the `by_org_scope_chunk` index (["orgId","scope","chunk_id"],
-// isolation fields first) — NEVER an unfiltered/global scan. `.collect()` on
-// an equality-only prefix (orgId, scope) is bounded by the isolation scope's
-// own row count, not the whole table; same requireOrgScope guard as
-// insertChunks/searchCorpus (deny by default).
+// isolation fields first) — NEVER an unfiltered/global scan. Same
+// requireOrgScope guard as insertChunks/searchCorpus (deny by default).
+//
+// PAGED, never a single `.collect()` (fixed in 0.4.1 — VP task
+// k171tdmy8xwx8ss0yckae0pdbn8cfxad): Themis proved on an isolated deployment
+// (same platform version as prod) that `.collect()` RAISES "Too many bytes
+// read in a single function execution (limit: 16777216 bytes)" past ~16MB
+// and NEVER truncates — on the real scope (144283 rows, each far larger
+// than her 500-byte padding) a single collect raises before returning. The
+// caller's contract is unchanged: still returns a plain `number`, still the
+// exact total, still bounded by the same `by_org_scope_chunk` index prefix —
+// only the READ STRATEGY changes, from one unbounded collect to repeated
+// bounded pages accumulated in-memory as a running scalar (never buffering
+// the rows themselves), so no single function execution ever reads more
+// than one page's worth of bytes regardless of how large the scope is.
+const COUNT_CHUNKS_PAGE_SIZE = 500;
+
 export const countChunks = query({
 	args: {
 		orgId: v.string(),
@@ -189,12 +202,22 @@ export const countChunks = query({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		const rows = await ctx.db
-			.query("chunks")
-			.withIndex("by_org_scope_chunk", (q) =>
-				q.eq("orgId", args.orgId).eq("scope", args.scope),
-			)
-			.collect();
-		return rows.length;
+
+		let total = 0;
+		let cursor: string | null = null;
+		while (true) {
+			const page = await ctx.db
+				.query("chunks")
+				.withIndex("by_org_scope_chunk", (q) =>
+					q.eq("orgId", args.orgId).eq("scope", args.scope),
+				)
+				.paginate({ cursor, numItems: COUNT_CHUNKS_PAGE_SIZE });
+			total += page.page.length;
+			if (page.isDone) {
+				break;
+			}
+			cursor = page.continueCursor;
+		}
+		return total;
 	},
 });
