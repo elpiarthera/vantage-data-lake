@@ -1,5 +1,30 @@
 # @vantageos/data-lake — Changelog
 
+## 0.4.5 — 2026-08-15 — fix: structured ConvexError payloads for every consumer-reachable refusal
+
+**Root cause (Pi + operator finding).** The write-time-counter refusal work (0.4.3-0.4.4,
+PR #11) sharpened `countChunks`/`countDocuments` from a silent `0` into a named refusal
+(`throw new Error(...)` naming org+scope+cause) — but a plain `Error` thrown from a Convex
+function reaches every client as an opaque `"Server Error"` plus a request id; only
+`ConvexError` carries a payload across the client boundary. The whole shipped value (refuse
+instead of lying) was unreadable at the endpoint.
+
+**Fix.** Every consumer-reachable throw in `component/chunksV1.ts` and
+`component/documentsV1.ts` now throws `ConvexError({ code, orgId, scope, message })` instead
+of a bare `Error`, so a caller reads organisation, scope and cause AS DATA and can switch on
+`error.data.code`. Codes: `org_required`, `scope_required`, `scope_not_initialized`,
+`scope_bootstrap_in_progress`, `write_refused_bootstrapping`, `scope_has_unmeasured_rows`,
+`internal_invariant` (the two internal-invariant-only throws, not a normal consumer path).
+`scope_not_initialized` ("never seeded") and `scope_bootstrap_in_progress` ("seeding in
+progress") are now distinct codes a client can branch on, instead of two message strings that
+both surfaced as the same opaque "Server Error".
+
+**Proof boundary, stated explicitly.** `convex-test` proves the `ConvexError` is thrown with
+the right `.data` payload (this package's test suite, 71+ tests green) — it does NOT prove
+the payload survives the real Convex HTTP/client transport. That second proof requires a
+deployed endpoint and a real client observing `error.data` instead of `"Server Error"`, and
+comes only after publish + redeploy.
+
 ## 0.4.2 — 2026-08-14 — fix: tsc gate + 50 typecheck errors (missing `@convex-dev/rag` dependency)
 
 **Root cause.** `component/searchV1.ts` and `component/convex.config.ts` import

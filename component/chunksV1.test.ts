@@ -31,6 +31,7 @@
  */
 
 import { convexTest } from "convex-test";
+import { ConvexError } from "convex/values";
 import { describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import schema from "./schema.js";
@@ -38,6 +39,38 @@ import schema from "./schema.js";
 const modules = import.meta.glob("./**/*.ts");
 
 const createT = () => convexTest(schema, modules);
+
+// expectRefusal — asserts a rejected promise is a structured `ConvexError`
+// (Pi + operator finding, follow-up to REVISE rounds 1-2: a plain Error
+// reaches every Convex client as an opaque "Server Error" + a request id;
+// only ConvexError carries a payload across the client boundary). Matching
+// only the message string does NOT prove the payload crosses the boundary —
+// this asserts `error.data.code`/`orgId`/`scope` as DATA, the actual shape a
+// client reads.
+async function expectRefusal(
+	promise: Promise<unknown>,
+	code: string,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	let caught: unknown;
+	try {
+		await promise;
+	} catch (err) {
+		caught = err;
+	}
+	expect(caught).toBeInstanceOf(ConvexError);
+	const convexError = caught as ConvexError<string>;
+	// convex-test round-trips `.data` through the wire exactly like a real
+	// Convex client — it arrives JSON-STRINGIFIED, not as a live object. This
+	// IS the proof the payload survives serialization to the client
+	// boundary; parsing it here is the same step a real consumer takes.
+	const data =
+		typeof convexError.data === "string"
+			? JSON.parse(convexError.data)
+			: convexError.data;
+	expect(data).toMatchObject({ code, orgId, scope });
+}
 
 describe("component/chunksV1.ts — insertChunks + searchCorpus (BM25-only, no embeddings)", () => {
 	test("insertChunks stores N chunks under (orgId, scope) and returns the count", async () => {
@@ -128,24 +161,30 @@ describe("component/chunksV1.ts — insertChunks + searchCorpus (BM25-only, no e
 
 	test("searchCorpus refuses an empty orgId — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.searchCorpus, {
 				orgId: "",
 				scope: "droit-du-travail",
 				query: "anything",
 			}),
-		).rejects.toThrow(/orgId/i);
+			"org_required",
+			"",
+			"droit-du-travail",
+		);
 	});
 
 	test("searchCorpus refuses an empty scope — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.searchCorpus, {
 				orgId: "org-a",
 				scope: "",
 				query: "anything",
 			}),
-		).rejects.toThrow(/scope/i);
+			"scope_required",
+			"org-a",
+			"",
+		);
 	});
 
 	test("insertChunks-by-chunk_id idempotence — re-ingesting the same chunk_id (same orgId+scope) patches in place, row count stable", async () => {
@@ -447,32 +486,41 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 	test("unmeasured scope — countChunks on a non-existent (orgId, scope) THROWS, never a silent 0", async () => {
 		const t = createT();
 
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-never-seeded",
 				scope: "scope-never-seeded",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-never-seeded",
+			"scope-never-seeded",
+		);
 	});
 
 	test("countChunks refuses an empty orgId — deny by default, same guard as insertChunks/searchCorpus", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "",
 				scope: "some-scope",
 			}),
-		).rejects.toThrow(/orgId/i);
+			"org_required",
+			"",
+			"some-scope",
+		);
 	});
 
 	test("countChunks refuses an empty scope — deny by default, same guard as insertChunks/searchCorpus", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-count",
 				scope: "",
 			}),
-		).rejects.toThrow(/scope/i);
+			"scope_required",
+			"org-count",
+			"",
+		);
 	});
 
 	test("countChunks stays O(1)-correct at N=1250 (well past any prior page-size boundary) — counter, not a scan", async () => {
@@ -608,12 +656,15 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		const t = createT();
 		await seedHistoricalChunks(t, "org-hist", "hist-scope", 12);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-hist",
 				scope: "hist-scope",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-hist",
+			"hist-scope",
+		);
 	});
 
 	test("bootstrapScopeCount walks a historical scope to completion; total === N; countChunks then returns N", async () => {
@@ -729,12 +780,15 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-partial",
 				scope: "partial-scope",
 			}),
-		).rejects.toThrow(/bootstrap in progress/i);
+			"scope_bootstrap_in_progress",
+			"org-partial",
+			"partial-scope",
+		);
 	});
 
 	test("interrupted then resumed bootstrap — stops before done, countChunks throws in the interval, resuming reaches exact total with no double-count and no loss", async () => {
@@ -751,12 +805,15 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		expect(interrupted.done).toBe(false);
 		expect(interrupted.total).toBeLessThan(N);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-resume",
 				scope: "resume-scope",
 			}),
-		).rejects.toThrow(/bootstrap in progress/i);
+			"scope_bootstrap_in_progress",
+			"org-resume",
+			"resume-scope",
+		);
 
 		// Resume to completion.
 		let result = interrupted;
@@ -791,7 +848,7 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.chunksV1.insertChunks, {
 				orgId: "org-race",
 				scope: "race-scope",
@@ -804,7 +861,10 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 					},
 				],
 			}),
-		).rejects.toThrow(/bootstrapping/i);
+			"write_refused_bootstrapping",
+			"org-race",
+			"race-scope",
+		);
 	});
 
 	test("deleteChunk refuses a delete on a bootstrapping scope", async () => {
@@ -819,13 +879,16 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.chunksV1.deleteChunk, {
 				orgId: "org-race-del",
 				scope: "race-del-scope",
 				chunk_id: "hist-00000",
 			}),
-		).rejects.toThrow(/bootstrapping/i);
+			"write_refused_bootstrapping",
+			"org-race-del",
+			"race-del-scope",
+		);
 	});
 
 	test("insertChunks on a ready scope passes and increments normally", async () => {
@@ -867,7 +930,7 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		const t = createT();
 		await seedHistoricalChunks(t, "org-eta-probe2", "eta-probe2-scope", 10);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.chunksV1.insertChunks, {
 				orgId: "org-eta-probe2",
 				scope: "eta-probe2-scope",
@@ -880,15 +943,21 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 					},
 				],
 			}),
-		).rejects.toThrow(/pre-existing unmeasured rows/i);
+			"scope_has_unmeasured_rows",
+			"org-eta-probe2",
+			"eta-probe2-scope",
+		);
 
 		// countChunks still throws — no false-ready-1 was ever stamped.
-		await expect(
+		await expectRefusal(
 			t.query(api.chunksV1.countChunks, {
 				orgId: "org-eta-probe2",
 				scope: "eta-probe2-scope",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-eta-probe2",
+			"eta-probe2-scope",
+		);
 
 		// Bootstrap is required and, once run to completion, is authoritative
 		// at N=10 (the historical rows) — the refused insert never landed.

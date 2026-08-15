@@ -33,10 +33,20 @@
  * whichever deployment Talos/Thémis will repoint CONVEX_URL to.
  */
 
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server.js";
 import type { MutationCtx } from "./_generated/server.js";
 
+// Structured refusal payloads (Pi + operator finding, follow-up to REVISE
+// rounds 1-2): a plain Error thrown with a bare string reaches every Convex
+// client as an opaque "Server Error" + a request id — ONLY `ConvexError`
+// carries its payload across the client boundary. Every consumer-reachable
+// refusal below throws `ConvexError({ code, orgId, scope, message })` so a
+// caller reads organisation, scope and cause AS DATA and can switch on
+// `error.data.code` — in particular distinguishing "never seeded"
+// (scope_not_initialized) from "seeding in progress"
+// (scope_bootstrap_in_progress), which a message-only Error left as two
+// indistinguishable strings at the client.
 const chunkInputValidator = v.object({
 	chunk_id: v.string(),
 	text: v.string(),
@@ -47,14 +57,22 @@ const chunkInputValidator = v.object({
 
 function requireOrgScope(orgId: string, scope: string): void {
 	if (!orgId) {
-		throw new Error(
-			"orgId is required — deny by default, refusing an unscoped chunks write/read.",
-		);
+		throw new ConvexError({
+			code: "org_required" as const,
+			orgId,
+			scope,
+			message:
+				"orgId is required — deny by default, refusing an unscoped chunks write/read.",
+		});
 	}
 	if (!scope) {
-		throw new Error(
-			"scope is required — deny by default, refusing an unscoped chunks write/read.",
-		);
+		throw new ConvexError({
+			code: "scope_required" as const,
+			orgId,
+			scope,
+			message:
+				"scope is required — deny by default, refusing an unscoped chunks write/read.",
+		});
 	}
 }
 
@@ -85,9 +103,13 @@ async function incrementChunkScopeCount(
 		)
 		.unique();
 	if (row === null) {
-		throw new Error(
-			"increment: counter row missing — ensureScopeMeasuredForWrite must run first",
-		);
+		throw new ConvexError({
+			code: "internal_invariant" as const,
+			orgId,
+			scope,
+			message:
+				"increment: counter row missing — ensureScopeMeasuredForWrite must run first",
+		});
 	}
 	await ctx.db.patch(row._id, { count: row.count + 1 });
 }
@@ -123,9 +145,12 @@ async function ensureScopeMeasuredForWrite(
 
 	if (row !== null) {
 		if (row.status === "bootstrapping") {
-			throw new Error(
-				`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
-			);
+			throw new ConvexError({
+				code: "write_refused_bootstrapping" as const,
+				orgId,
+				scope,
+				message: `${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+			});
 		}
 		// status === "ready" — already measured, proceed.
 		return;
@@ -168,9 +193,12 @@ async function ensureScopeMeasuredForWrite(
 		status: "bootstrapping",
 		bootstrap_cursor: "",
 	});
-	throw new Error(
-		`${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapScopeCount first`,
-	);
+	throw new ConvexError({
+		code: "scope_has_unmeasured_rows" as const,
+		orgId,
+		scope,
+		message: `${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapScopeCount first`,
+	});
 }
 
 // decrementChunkScopeCount — never below 0; a missing counter row is treated
@@ -385,14 +413,20 @@ export const countChunks = query({
 			.unique();
 
 		if (row === null) {
-			throw new Error(
-				`countChunks: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first`,
-			);
+			throw new ConvexError({
+				code: "scope_not_initialized" as const,
+				orgId: args.orgId,
+				scope: args.scope,
+				message: `countChunks: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first`,
+			});
 		}
 		if (row.status !== "ready") {
-			throw new Error(
-				`countChunks: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
-			);
+			throw new ConvexError({
+				code: "scope_bootstrap_in_progress" as const,
+				orgId: args.orgId,
+				scope: args.scope,
+				message: `countChunks: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
+			});
 		}
 		return row.count;
 	},
@@ -456,7 +490,12 @@ export const bootstrapScopeCount = mutation({
 			});
 			row = await ctx.db.get(insertedId);
 			if (row === null) {
-				throw new Error("bootstrapScopeCount: failed to read back inserted counter row");
+				throw new ConvexError({
+					code: "internal_invariant" as const,
+					orgId: args.orgId,
+					scope: args.scope,
+					message: "bootstrapScopeCount: failed to read back inserted counter row",
+				});
 			}
 		}
 

@@ -14,10 +14,14 @@
  * only owns the `documents` table's CRUD-lite surface.
  */
 
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server.js";
 import type { MutationCtx } from "./_generated/server.js";
 
+// Structured refusal payloads — mirrors chunksV1's contract 1:1 (Pi +
+// operator finding: a plain Error thrown with a bare string reaches every
+// Convex client as an opaque "Server Error" + a request id; only `ConvexError`
+// carries its payload across the client boundary).
 const documentInputValidator = v.object({
 	document_id: v.string(),
 	text: v.string(),
@@ -28,14 +32,22 @@ const documentInputValidator = v.object({
 
 function requireOrgScope(orgId: string, scope: string): void {
 	if (!orgId) {
-		throw new Error(
-			"orgId is required — deny by default, refusing an unscoped documents write/read.",
-		);
+		throw new ConvexError({
+			code: "org_required" as const,
+			orgId,
+			scope,
+			message:
+				"orgId is required — deny by default, refusing an unscoped documents write/read.",
+		});
 	}
 	if (!scope) {
-		throw new Error(
-			"scope is required — deny by default, refusing an unscoped documents write/read.",
-		);
+		throw new ConvexError({
+			code: "scope_required" as const,
+			orgId,
+			scope,
+			message:
+				"scope is required — deny by default, refusing an unscoped documents write/read.",
+		});
 	}
 }
 
@@ -61,9 +73,13 @@ async function incrementDocumentScopeCount(
 		)
 		.unique();
 	if (row === null) {
-		throw new Error(
-			"increment: counter row missing — ensureDocumentScopeMeasuredForWrite must run first",
-		);
+		throw new ConvexError({
+			code: "internal_invariant" as const,
+			orgId,
+			scope,
+			message:
+				"increment: counter row missing — ensureDocumentScopeMeasuredForWrite must run first",
+		});
 	}
 	await ctx.db.patch(row._id, { count: row.count + 1 });
 }
@@ -91,9 +107,12 @@ async function ensureDocumentScopeMeasuredForWrite(
 
 	if (row !== null) {
 		if (row.status === "bootstrapping") {
-			throw new Error(
-				`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
-			);
+			throw new ConvexError({
+				code: "write_refused_bootstrapping" as const,
+				orgId,
+				scope,
+				message: `${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+			});
 		}
 		// status === "ready" — already measured, proceed.
 		return;
@@ -134,9 +153,12 @@ async function ensureDocumentScopeMeasuredForWrite(
 		status: "bootstrapping",
 		bootstrap_cursor: "",
 	});
-	throw new Error(
-		`${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapDocumentScopeCount first`,
-	);
+	throw new ConvexError({
+		code: "scope_has_unmeasured_rows" as const,
+		orgId,
+		scope,
+		message: `${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapDocumentScopeCount first`,
+	});
 }
 
 // decrementDocumentScopeCount — never below 0; a missing counter row is
@@ -331,14 +353,20 @@ export const countDocuments = query({
 			.unique();
 
 		if (row === null) {
-			throw new Error(
-				`countDocuments: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapDocumentScopeCount first`,
-			);
+			throw new ConvexError({
+				code: "scope_not_initialized" as const,
+				orgId: args.orgId,
+				scope: args.scope,
+				message: `countDocuments: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapDocumentScopeCount first`,
+			});
 		}
 		if (row.status !== "ready") {
-			throw new Error(
-				`countDocuments: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
-			);
+			throw new ConvexError({
+				code: "scope_bootstrap_in_progress" as const,
+				orgId: args.orgId,
+				scope: args.scope,
+				message: `countDocuments: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
+			});
 		}
 		return row.count;
 	},
@@ -386,9 +414,12 @@ export const bootstrapDocumentScopeCount = mutation({
 			});
 			row = await ctx.db.get(insertedId);
 			if (row === null) {
-				throw new Error(
-					"bootstrapDocumentScopeCount: failed to read back inserted counter row",
-				);
+				throw new ConvexError({
+					code: "internal_invariant" as const,
+					orgId: args.orgId,
+					scope: args.scope,
+					message: "bootstrapDocumentScopeCount: failed to read back inserted counter row",
+				});
 			}
 		}
 

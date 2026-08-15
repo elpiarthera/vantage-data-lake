@@ -20,6 +20,7 @@
  */
 
 import { convexTest } from "convex-test";
+import { ConvexError } from "convex/values";
 import { describe, expect, test } from "vitest";
 import { api } from "./_generated/api.js";
 import schema from "./schema.js";
@@ -27,6 +28,35 @@ import schema from "./schema.js";
 const modules = import.meta.glob("./**/*.ts");
 
 const createT = () => convexTest(schema, modules);
+
+// expectRefusal — mirrors chunksV1.test.ts's helper 1:1: asserts a rejected
+// promise is a structured ConvexError, checking `error.data.code`/`orgId`/
+// `scope` as DATA (not just the message string) — the actual shape a client
+// reads across the Convex boundary.
+async function expectRefusal(
+	promise: Promise<unknown>,
+	code: string,
+	orgId: string,
+	scope: string,
+): Promise<void> {
+	let caught: unknown;
+	try {
+		await promise;
+	} catch (err) {
+		caught = err;
+	}
+	expect(caught).toBeInstanceOf(ConvexError);
+	const convexError = caught as ConvexError<string>;
+	// convex-test round-trips `.data` through the wire exactly like a real
+	// Convex client — it arrives JSON-STRINGIFIED, not as a live object. This
+	// IS the proof the payload survives serialization to the client
+	// boundary; parsing it here is the same step a real consumer takes.
+	const data =
+		typeof convexError.data === "string"
+			? JSON.parse(convexError.data)
+			: convexError.data;
+	expect(data).toMatchObject({ code, orgId, scope });
+}
 
 describe("component/documentsV1.ts — insertDocuments + getDocument (upsert, byte-identical pattern to chunksV1)", () => {
 	test("insertDocuments upsert idempotence — re-inserting the same document_id patches in place, never duplicates", async () => {
@@ -145,12 +175,15 @@ describe("component/documentsV1.ts — insertDocuments + getDocument (upsert, by
 		// @616e8197). Isolation is still proven: the throw carries no leak of
 		// org-secret's count, and the positive control below confirms
 		// org-secret's own count is exact.
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-other",
 				scope: "jurisprudence",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-other",
+			"jurisprudence",
+		);
 
 		// POSITIVE CONTROL — the owning org DOES see its own document.
 		const ownDoc = await t.query(api.documentsV1.getDocument, {
@@ -168,24 +201,30 @@ describe("component/documentsV1.ts — insertDocuments + getDocument (upsert, by
 
 	test("insertDocuments refuses an empty orgId — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.mutation(api.documentsV1.insertDocuments, {
 				orgId: "",
 				scope: "jurisprudence",
 				documents: [{ document_id: "x", text: "x" }],
 			}),
-		).rejects.toThrow(/orgId/i);
+			"org_required",
+			"",
+			"jurisprudence",
+		);
 	});
 
 	test("insertDocuments refuses an empty scope — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.mutation(api.documentsV1.insertDocuments, {
 				orgId: "org-a",
 				scope: "",
 				documents: [{ document_id: "x", text: "x" }],
 			}),
-		).rejects.toThrow(/scope/i);
+			"scope_required",
+			"org-a",
+			"",
+		);
 	});
 });
 
@@ -333,32 +372,41 @@ describe("component/documentsV1.ts — countDocuments (write-time counter, exact
 	test("unmeasured scope — countDocuments on a non-existent (orgId, scope) THROWS, never a silent 0", async () => {
 		const t = createT();
 
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-never-seeded-docs",
 				scope: "scope-never-seeded-docs",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-never-seeded-docs",
+			"scope-never-seeded-docs",
+		);
 	});
 
 	test("countDocuments refuses an empty orgId — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "",
 				scope: "some-scope",
 			}),
-		).rejects.toThrow(/orgId/i);
+			"org_required",
+			"",
+			"some-scope",
+		);
 	});
 
 	test("countDocuments refuses an empty scope — deny by default", async () => {
 		const t = createT();
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-a",
 				scope: "",
 			}),
-		).rejects.toThrow(/scope/i);
+			"scope_required",
+			"org-a",
+			"",
+		);
 	});
 });
 
@@ -477,12 +525,15 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		const t = createT();
 		await seedHistoricalDocuments(t, "org-hist-docs", "hist-scope", 12);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-hist-docs",
 				scope: "hist-scope",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-hist-docs",
+			"hist-scope",
+		);
 	});
 
 	test("bootstrapDocumentScopeCount walks a historical scope to completion; total === N; countDocuments then returns N", async () => {
@@ -596,12 +647,15 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-partial-docs",
 				scope: "partial-scope",
 			}),
-		).rejects.toThrow(/bootstrap in progress/i);
+			"scope_bootstrap_in_progress",
+			"org-partial-docs",
+			"partial-scope",
+		);
 	});
 
 	test("interrupted then resumed bootstrap — stops before done, countDocuments throws in the interval, resuming reaches exact total with no double-count and no loss", async () => {
@@ -618,12 +672,15 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		expect(interrupted.done).toBe(false);
 		expect(interrupted.total).toBeLessThan(N);
 
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-resume-docs",
 				scope: "resume-scope",
 			}),
-		).rejects.toThrow(/bootstrap in progress/i);
+			"scope_bootstrap_in_progress",
+			"org-resume-docs",
+			"resume-scope",
+		);
 
 		// Resume to completion.
 		let result = interrupted;
@@ -658,7 +715,7 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.documentsV1.insertDocuments, {
 				orgId: "org-race-docs",
 				scope: "race-scope",
@@ -669,7 +726,10 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 					},
 				],
 			}),
-		).rejects.toThrow(/bootstrapping/i);
+			"write_refused_bootstrapping",
+			"org-race-docs",
+			"race-scope",
+		);
 	});
 
 	test("deleteDocument refuses a delete on a bootstrapping scope", async () => {
@@ -684,13 +744,16 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 		expect(partial.done).toBe(false);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.documentsV1.deleteDocument, {
 				orgId: "org-race-del-docs",
 				scope: "race-del-scope",
 				document_id: "hist-doc-00000",
 			}),
-		).rejects.toThrow(/bootstrapping/i);
+			"write_refused_bootstrapping",
+			"org-race-del-docs",
+			"race-del-scope",
+		);
 	});
 
 	test("insertDocuments on a ready scope passes and increments normally", async () => {
@@ -728,7 +791,7 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		const t = createT();
 		await seedHistoricalDocuments(t, "org-eta-probe2-docs", "eta-probe2-scope", 10);
 
-		await expect(
+		await expectRefusal(
 			t.mutation(api.documentsV1.insertDocuments, {
 				orgId: "org-eta-probe2-docs",
 				scope: "eta-probe2-scope",
@@ -739,15 +802,21 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 					},
 				],
 			}),
-		).rejects.toThrow(/pre-existing unmeasured rows/i);
+			"scope_has_unmeasured_rows",
+			"org-eta-probe2-docs",
+			"eta-probe2-scope",
+		);
 
 		// countDocuments still throws — no false-ready-1 was ever stamped.
-		await expect(
+		await expectRefusal(
 			t.query(api.documentsV1.countDocuments, {
 				orgId: "org-eta-probe2-docs",
 				scope: "eta-probe2-scope",
 			}),
-		).rejects.toThrow(/not initialized/i);
+			"scope_not_initialized",
+			"org-eta-probe2-docs",
+			"eta-probe2-scope",
+		);
 
 		// Bootstrap is required and, once run to completion, is authoritative
 		// at N=10 (the historical rows) — the refused insert never landed.
