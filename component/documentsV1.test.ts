@@ -873,10 +873,12 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		expect(count).toBe(2);
 	});
 
-	// Mirrors chunksV1.test.ts's byte-budget suite 1:1 — see that file's
-	// comment for the full rationale (Pi's measured prod defect: "Uncaught
-	// Error: Too many bytes read in a single function execution (limit:
-	// 16777216 bytes)").
+	// Mirrors chunksV1.test.ts's .take(k) suite 1:1 — see that file's
+	// comment for the full rationale (measured firsthand by the coordinator
+	// on a real dev deployment: "Uncaught Error: Too many bytes read in a
+	// single function execution (limit: 16777216 bytes)" still threw under
+	// the 0.4.6 "byte-budget" `for await` logic — a JS-side `break` never
+	// bounds what the Convex runtime prefetches).
 	async function seedLargeHistoricalDocuments(
 		t: ReturnType<typeof createT>,
 		orgId: string,
@@ -899,50 +901,55 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 	}
 
-	// CAVEAT (stated per coordinator's TESTS instruction): convex-test does
-	// NOT enforce the real Convex runtime's 16MiB-per-execution read limit —
-	// this suite proves the page-breaks-by-BYTES LOGIC (a round stops at the
-	// MAX_PAGE_BYTES budget, well before exhausting the rows available), NOT
-	// that it avoids the real 16MiB limit on a live deployment. That
-	// endpoint proof (bootstrapping a large-doc scope on a real deployment
-	// without the throw) is a post-merge step, cited then.
-	test("byte-budgeted bootstrap: a page breaks on BYTES (not on running out of rows) for large-text historical documents; final total exact, no double-count on resume", async () => {
+	// CAVEAT (stated, not hidden): convex-test does NOT enforce the real
+	// Convex runtime's 16MiB-per-execution read limit — this suite proves
+	// the page-bounded-by-.take(k) LOGIC (a round returns EXACTLY k rows,
+	// deterministically), NOT that .take(k) avoids the real limit on a live
+	// deployment. That endpoint proof is a post-merge, post-publish step
+	// run at the endpoint (the byte-budget-proof scope of 25×700KB rows
+	// already exists on dashing-ermine-394), not provable here.
+	test(".take(k)-bounded bootstrap: each round returns EXACTLY k=pageSize rows (deterministic, not JS-side byte estimation) for large-text historical documents; final total exact, no double-count on resume", async () => {
 		const t = createT();
 		const N = 40;
+		const pageSize = 8;
 		const textBytes = 300 * 1024;
 		await seedLargeHistoricalDocuments(
 			t,
-			"org-bytebudget-docs",
-			"bytebudget-scope",
+			"org-takebound-docs",
+			"takebound-scope",
 			N,
 			textBytes,
 		);
 
 		const first = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
-			orgId: "org-bytebudget-docs",
-			scope: "bytebudget-scope",
+			orgId: "org-takebound-docs",
+			scope: "takebound-scope",
+			pageSize,
 		});
 		expect(first.done).toBe(false);
-		expect(first.processed).toBeGreaterThan(0);
-		expect(first.processed).toBeLessThan(N);
+		expect(first.processed).toBe(pageSize);
 
 		let result = first;
 		let iterations = 1;
 		while (!result.done) {
 			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
-				orgId: "org-bytebudget-docs",
-				scope: "bytebudget-scope",
+				orgId: "org-takebound-docs",
+				scope: "takebound-scope",
+				pageSize,
 			});
 			iterations += 1;
-			if (iterations > 50) throw new Error("byte-budget bootstrap loop did not converge");
+			if (iterations > 50) throw new Error("take(k) bootstrap loop did not converge");
+			if (!result.done) {
+				expect(result.processed).toBe(pageSize);
+			}
 		}
 
 		expect(result.total).toBe(N);
-		expect(iterations).toBeGreaterThan(1);
+		expect(iterations).toBe(N / pageSize + 1); // 5 data rounds of exactly pageSize + 1 final round (processed:0) that flips status to ready
 
 		const count = await t.query(api.documentsV1.countDocuments, {
-			orgId: "org-bytebudget-docs",
-			scope: "bytebudget-scope",
+			orgId: "org-takebound-docs",
+			scope: "takebound-scope",
 		});
 		expect(count).toBe(N);
 	});

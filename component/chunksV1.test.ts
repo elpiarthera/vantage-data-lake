@@ -1019,10 +1019,11 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 	});
 
 	// Directly inserts rows with a LARGE `text` field, simulating the prod
-	// defect Pi measured: "Uncaught Error: Too many bytes read in a single
-	// function execution (limit: 16777216 bytes)" — a fixed pageSize=500
-	// `.take()` still materializes whole documents purely to count them, and
-	// voluminous legal-ruling text crosses 16MiB well under 500 rows.
+	// defect that motivated (and then falsified) the byte-budget attempt:
+	// "Uncaught Error: Too many bytes read in a single function execution
+	// (limit: 16777216 bytes)". A fixed pageSize=500 `.take()` (0.4.1-0.4.5)
+	// materializes whole documents purely to count them, and voluminous
+	// legal-ruling text crosses 16MiB well under 500 rows.
 	async function seedLargeHistoricalChunks(
 		t: ReturnType<typeof createT>,
 		orgId: string,
@@ -1047,54 +1048,71 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 	}
 
-	// CAVEAT (stated per coordinator's TESTS instruction): convex-test does
-	// NOT enforce the real Convex runtime's 16MiB-per-execution read limit —
-	// this suite proves the page-breaks-by-BYTES LOGIC (a round stops at the
-	// MAX_PAGE_BYTES budget, well before exhausting the rows available), NOT
-	// that it avoids the real 16MiB limit on a live deployment. That
-	// endpoint proof (bootstrapping a large-doc scope on a real deployment
-	// without the throw) is a post-merge step, cited then.
-	test("byte-budgeted bootstrap: a page breaks on BYTES (not on running out of rows) for large-text historical chunks; final total exact, no double-count on resume", async () => {
+	// 0.4.7 CORRECTION (0.4.6 false fix): a JS-side `break` over a
+	// `for await` iterator does NOT bound the bytes the Convex runtime
+	// reads — the iterator prefetches storage ahead of JS consumption, so
+	// accumulating `bytesSoFar` and breaking on a budget only stopped the
+	// LOOP, never the read the runtime had already issued. Measured
+	// firsthand by the coordinator on a real dev deployment: 25
+	// counter-less rows of ~700 KB each still threw "Too many bytes read
+	// (limit: 16777216)" under the 0.4.6 "byte-budget" logic. The fix is
+	// `.take(k)` — the ONLY construct that bounds what the Convex runtime
+	// actually reads to exactly k documents.
+	//
+	// CAVEAT (stated, not hidden): convex-test does NOT enforce the real
+	// Convex runtime's 16MiB-per-execution read limit — this suite proves
+	// the page-bounded-by-.take(k) LOGIC (a round returns EXACTLY k rows,
+	// deterministically, never more), NOT that .take(k) avoids the real
+	// limit on a live deployment (that follows structurally from Convex's
+	// 1 MiB max document size × k ≤ 15, but is not something convex-test
+	// can measure). The REAL proof is re-staging on the dev deployment (the
+	// byte-budget-proof scope of 25×700KB rows already exists on
+	// dashing-ermine-394) and bootstrapping to done WITHOUT the throw — a
+	// post-merge, post-publish step run at the endpoint, not provable here.
+	test(".take(k)-bounded bootstrap: each round returns EXACTLY k=pageSize rows (deterministic, not JS-side byte estimation) for large-text historical chunks; final total exact, no double-count on resume", async () => {
 		const t = createT();
-		// Each row ~= 300KB of `text` (well under 8MiB alone) — 40 rows push
-		// well past the 8MiB MAX_PAGE_BYTES budget while still leaving rows
-		// unconsumed, forcing the loop to break on bytes, not on exhausting
-		// the index range.
+		// Each row ~= 300KB of `text`. pageSize=8 explicit (matches
+		// SAFE_DEFAULT_PAGE) — deterministic assertion: every non-final round
+		// returns EXACTLY 8, never more, never a byte-dependent number.
 		const N = 40;
+		const pageSize = 8;
 		const textBytes = 300 * 1024;
-		await seedLargeHistoricalChunks(t, "org-bytebudget", "bytebudget-scope", N, textBytes);
+		await seedLargeHistoricalChunks(t, "org-takebound", "takebound-scope", N, textBytes);
 
 		const first = await t.mutation(api.chunksV1.bootstrapScopeCount, {
-			orgId: "org-bytebudget",
-			scope: "bytebudget-scope",
+			orgId: "org-takebound",
+			scope: "takebound-scope",
+			pageSize,
 		});
 		expect(first.done).toBe(false);
-		// The defining assertion: this round's processed count is LESS than
-		// the total historical rows — the loop broke on the byte budget, not
-		// because it ran out of rows to read.
-		expect(first.processed).toBeGreaterThan(0);
-		expect(first.processed).toBeLessThan(N);
+		// The defining assertion: this round's processed count is EXACTLY
+		// pageSize — .take(k) bounds the read deterministically, not a
+		// byte-estimation heuristic that could vary with content.
+		expect(first.processed).toBe(pageSize);
 
 		let result = first;
 		let iterations = 1;
 		while (!result.done) {
 			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
-				orgId: "org-bytebudget",
-				scope: "bytebudget-scope",
+				orgId: "org-takebound",
+				scope: "takebound-scope",
+				pageSize,
 			});
 			iterations += 1;
-			if (iterations > 50) throw new Error("byte-budget bootstrap loop did not converge");
+			if (iterations > 50) throw new Error("take(k) bootstrap loop did not converge");
+			if (!result.done) {
+				expect(result.processed).toBe(pageSize);
+			}
 		}
 
 		expect(result.total).toBe(N);
-		// Multiple rounds were required — this call did NOT collect
-		// everything in one page (proving the budget, not a row cap, drove
-		// the split, since N=40 is well under DEFAULT_MAX_ROWS_PER_PAGE=4096).
-		expect(iterations).toBeGreaterThan(1);
+		// N=40 / pageSize=8 = exactly 5 rounds — deterministic, proving the
+		// split is driven by .take(k), not an estimate.
+		expect(iterations).toBe(N / pageSize + 1); // 5 data rounds of exactly pageSize + 1 final round (processed:0) that flips status to ready
 
 		const count = await t.query(api.chunksV1.countChunks, {
-			orgId: "org-bytebudget",
-			scope: "bytebudget-scope",
+			orgId: "org-takebound",
+			scope: "takebound-scope",
 		});
 		expect(count).toBe(N);
 	});
