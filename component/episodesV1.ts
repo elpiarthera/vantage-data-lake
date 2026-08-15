@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import {
 	creatorValidator,
@@ -47,9 +47,11 @@ export const storeEpisode = mutation({
 	returns: v.id("memories"),
 	handler: async (ctx, args) => {
 		if (args.embedding === undefined) {
-			throw new Error(
-				"embedding required — host must compute via aiClient.embed before storeEpisode call. See ADR Phase E.0 + README contract.",
-			);
+			throw new ConvexError({
+				code: "embedding_required" as const,
+				message:
+					"embedding required — host must compute via aiClient.embed before storeEpisode call. See ADR Phase E.0 + README contract.",
+			});
 		}
 
 		const now = Date.now();
