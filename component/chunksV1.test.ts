@@ -736,4 +736,130 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 			}),
 		).rejects.toThrow(/bootstrap in progress/i);
 	});
+
+	test("interrupted then resumed bootstrap — stops before done, countChunks throws in the interval, resuming reaches exact total with no double-count and no loss", async () => {
+		const t = createT();
+		const N = 97;
+		await seedHistoricalChunks(t, "org-resume", "resume-scope", N);
+
+		// First call only — deliberately NOT looped to completion.
+		const interrupted = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-resume",
+			scope: "resume-scope",
+			pageSize: 20,
+		});
+		expect(interrupted.done).toBe(false);
+		expect(interrupted.total).toBeLessThan(N);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-resume",
+				scope: "resume-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
+
+		// Resume to completion.
+		let result = interrupted;
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-resume",
+				scope: "resume-scope",
+				pageSize: 20,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("resume loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-resume",
+			scope: "resume-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("insertChunks refuses a write to a bootstrapping scope — write-race class closed, not merely documented", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalChunks(t, "org-race", "race-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-race",
+			scope: "race-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: "org-race",
+				scope: "race-scope",
+				chunks: [
+					{
+						chunk_id: "race-new",
+						text: "Racing an in-progress bootstrap.",
+						legal_references: [],
+						source_ref: "src/race-new",
+					},
+				],
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("deleteChunk refuses a delete on a bootstrapping scope", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalChunks(t, "org-race-del", "race-del-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-race-del",
+			scope: "race-del-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.chunksV1.deleteChunk, {
+				orgId: "org-race-del",
+				scope: "race-del-scope",
+				chunk_id: "hist-00000",
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("insertChunks on a ready scope passes and increments normally", async () => {
+		const t = createT();
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+			chunks: [
+				{
+					chunk_id: "seed-1",
+					text: "Seeds a ready scope.",
+					legal_references: [],
+					source_ref: "src/seed-1",
+				},
+			],
+		});
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+			chunks: [
+				{
+					chunk_id: "seed-2",
+					text: "Second write to an already-ready scope.",
+					legal_references: [],
+					source_ref: "src/seed-2",
+				},
+			],
+		});
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+		});
+		expect(count).toBe(2);
+	});
 });

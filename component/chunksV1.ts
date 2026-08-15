@@ -90,6 +90,31 @@ async function incrementChunkScopeCount(
 	}
 }
 
+// requireNotBootstrapping — closes the write-race class instead of merely
+// documenting it as a precondition (coordinator DELTA 2, follow-up to Eta
+// REVISE PR #11 @616e8197): a write racing an in-progress bootstrap walk
+// could land behind the walk's cursor and be silently swallowed, or land
+// ahead of it and be double-counted once the walk resumes. Both
+// insertChunks and deleteChunk load the counter row FIRST and refuse
+// outright when it is mid-bootstrap; a fresh scope (no row) or an already
+// "ready" scope proceeds exactly as before.
+async function requireNotBootstrapping(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+	opName: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("chunk_scope_counts")
+		.withIndex("by_org_scope", (q) => q.eq("org_id", orgId).eq("scope", scope))
+		.unique();
+	if (row !== null && row.status === "bootstrapping") {
+		throw new Error(
+			`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+		);
+	}
+}
+
 // decrementChunkScopeCount — never below 0; a missing counter row is treated
 // as already-0 (no-op), never an error.
 async function decrementChunkScopeCount(
@@ -129,6 +154,7 @@ export const insertChunks = mutation({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
+		await requireNotBootstrapping(ctx, args.orgId, args.scope, "insertChunks");
 		const now = Date.now();
 		for (const chunk of args.chunks) {
 			const existing = await ctx.db
@@ -186,6 +212,7 @@ export const deleteChunk = mutation({
 	returns: v.boolean(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
+		await requireNotBootstrapping(ctx, args.orgId, args.scope, "deleteChunk");
 		const existing = await ctx.db
 			.query("chunks")
 			.withIndex("by_org_scope_chunk", (q) =>
@@ -301,12 +328,12 @@ export const countChunks = query({
 
 		if (row === null) {
 			throw new Error(
-				"countChunks: scope not initialized for (orgId,scope) — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first",
+				`countChunks: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first`,
 			);
 		}
 		if (row.status !== "ready") {
 			throw new Error(
-				"countChunks: scope bootstrap in progress — count not yet authoritative",
+				`countChunks: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
 			);
 		}
 		return row.count;
@@ -330,10 +357,11 @@ export const countChunks = query({
 // double-counts); a repeated call mid-walk re-reads from the
 // already-advanced cursor, so no row is ever counted twice.
 //
-// PRECONDITION (not enforced, documented loudly): the scope MUST be
-// QUIESCENT during bootstrap — ingestion (insertChunks/deleteChunk) racing a
-// bootstrap walk on the SAME scope is out of contract; the walk assumes no
-// concurrent writes land behind its cursor while it runs.
+// Quiescence during bootstrap is now ENFORCED, not merely documented:
+// insertChunks/deleteChunk both refuse a write to a "bootstrapping" scope
+// via `requireNotBootstrapping` (coordinator DELTA 2) — the write-race class
+// this comment used to describe as an unenforced precondition no longer
+// exists; a caller gets a loud, named throw instead of a silent race.
 export const bootstrapScopeCount = mutation({
 	args: {
 		orgId: v.string(),
@@ -385,6 +413,10 @@ export const bootstrapScopeCount = mutation({
 			.take(pageSize);
 
 		if (page.length === 0) {
+			// An empty first page means the scope was walked and genuinely
+			// holds nothing — ready-0 here is a MEASURED zero, semantically
+			// distinct from the unmeasured-scope throw in countChunks;
+			// bootstrap is the deliberate measurement act that earns it.
 			await ctx.db.patch(row._id, { status: "ready" });
 			return { done: true, processed: 0, total: row.count, cursor };
 		}

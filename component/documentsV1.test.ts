@@ -603,4 +603,124 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 			}),
 		).rejects.toThrow(/bootstrap in progress/i);
 	});
+
+	test("interrupted then resumed bootstrap — stops before done, countDocuments throws in the interval, resuming reaches exact total with no double-count and no loss", async () => {
+		const t = createT();
+		const N = 97;
+		await seedHistoricalDocuments(t, "org-resume-docs", "resume-scope", N);
+
+		// First call only — deliberately NOT looped to completion.
+		const interrupted = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-resume-docs",
+			scope: "resume-scope",
+			pageSize: 20,
+		});
+		expect(interrupted.done).toBe(false);
+		expect(interrupted.total).toBeLessThan(N);
+
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-resume-docs",
+				scope: "resume-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
+
+		// Resume to completion.
+		let result = interrupted;
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+				orgId: "org-resume-docs",
+				scope: "resume-scope",
+				pageSize: 20,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("resume loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-resume-docs",
+			scope: "resume-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("insertDocuments refuses a write to a bootstrapping scope — write-race class closed, not merely documented", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalDocuments(t, "org-race-docs", "race-scope", N);
+
+		const partial = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-race-docs",
+			scope: "race-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.documentsV1.insertDocuments, {
+				orgId: "org-race-docs",
+				scope: "race-scope",
+				documents: [
+					{
+						document_id: "race-new",
+						text: "Racing an in-progress bootstrap.",
+					},
+				],
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("deleteDocument refuses a delete on a bootstrapping scope", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalDocuments(t, "org-race-del-docs", "race-del-scope", N);
+
+		const partial = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-race-del-docs",
+			scope: "race-del-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.documentsV1.deleteDocument, {
+				orgId: "org-race-del-docs",
+				scope: "race-del-scope",
+				document_id: "hist-doc-00000",
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("insertDocuments on a ready scope passes and increments normally", async () => {
+		const t = createT();
+		await t.mutation(api.documentsV1.insertDocuments, {
+			orgId: "org-ready-write-docs",
+			scope: "ready-write-scope",
+			documents: [
+				{
+					document_id: "seed-1",
+					text: "Seeds a ready scope.",
+				},
+			],
+		});
+
+		await t.mutation(api.documentsV1.insertDocuments, {
+			orgId: "org-ready-write-docs",
+			scope: "ready-write-scope",
+			documents: [
+				{
+					document_id: "seed-2",
+					text: "Second write to an already-ready scope.",
+				},
+			],
+		});
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-ready-write-docs",
+			scope: "ready-write-scope",
+		});
+		expect(count).toBe(2);
+	});
 });

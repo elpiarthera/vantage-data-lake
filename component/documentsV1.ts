@@ -70,6 +70,28 @@ async function incrementDocumentScopeCount(
 	}
 }
 
+// requireDocumentsNotBootstrapping — mirrors chunksV1's
+// requireNotBootstrapping 1:1 (coordinator DELTA 2): insertDocuments and
+// deleteDocument load the counter row FIRST and refuse a write outright
+// when it is mid-bootstrap, closing the write-race class instead of
+// merely documenting it as a precondition.
+async function requireDocumentsNotBootstrapping(
+	ctx: MutationCtx,
+	orgId: string,
+	scope: string,
+	opName: string,
+): Promise<void> {
+	const row = await ctx.db
+		.query("document_scope_counts")
+		.withIndex("by_org_scope", (q) => q.eq("org_id", orgId).eq("scope", scope))
+		.unique();
+	if (row !== null && row.status === "bootstrapping") {
+		throw new Error(
+			`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+		);
+	}
+}
+
 // decrementDocumentScopeCount — never below 0; a missing counter row is
 // treated as already-0 (no-op), never an error.
 async function decrementDocumentScopeCount(
@@ -106,6 +128,7 @@ export const insertDocuments = mutation({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
+		await requireDocumentsNotBootstrapping(ctx, args.orgId, args.scope, "insertDocuments");
 		const now = Date.now();
 		for (const document of args.documents) {
 			const existing = await ctx.db
@@ -208,6 +231,7 @@ export const deleteDocument = mutation({
 	returns: v.boolean(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
+		await requireDocumentsNotBootstrapping(ctx, args.orgId, args.scope, "deleteDocument");
 		const existing = await ctx.db
 			.query("documents")
 			.withIndex("by_org_scope_document", (q) =>
@@ -261,12 +285,12 @@ export const countDocuments = query({
 
 		if (row === null) {
 			throw new Error(
-				"countDocuments: scope not initialized for (orgId,scope) — refusing to return 0 on an unmeasured scope; run bootstrapDocumentScopeCount first",
+				`countDocuments: scope not initialized for org=${args.orgId} scope=${args.scope} — refusing to return 0 on an unmeasured scope; run bootstrapDocumentScopeCount first`,
 			);
 		}
 		if (row.status !== "ready") {
 			throw new Error(
-				"countDocuments: scope bootstrap in progress — count not yet authoritative",
+				`countDocuments: bootstrap in progress for org=${args.orgId} scope=${args.scope} — count not yet authoritative`,
 			);
 		}
 		return row.count;
@@ -277,8 +301,9 @@ export const countDocuments = query({
 // the `documents` table, walking via `by_org_scope_document` and advancing
 // the cursor on `document_id`. Same bounded-page, no-`.paginate()`,
 // no-unbounded-`.collect()`, resumable, idempotent-per-page contract.
-// PRECONDITION: the scope MUST be quiescent (no concurrent
-// insertDocuments/deleteDocument) during the walk.
+// Quiescence during bootstrap is ENFORCED (coordinator DELTA 2, mirrors
+// chunksV1): insertDocuments/deleteDocument both refuse a write to a
+// "bootstrapping" scope via `requireDocumentsNotBootstrapping`.
 export const bootstrapDocumentScopeCount = mutation({
 	args: {
 		orgId: v.string(),
@@ -335,6 +360,10 @@ export const bootstrapDocumentScopeCount = mutation({
 			.take(pageSize);
 
 		if (page.length === 0) {
+			// An empty first page means the scope was walked and genuinely
+			// holds nothing — ready-0 here is a MEASURED zero, semantically
+			// distinct from the unmeasured-scope throw in countDocuments;
+			// bootstrap is the deliberate measurement act that earns it.
 			await ctx.db.patch(row._id, { status: "ready" });
 			return { done: true, processed: 0, total: row.count, cursor };
 		}
