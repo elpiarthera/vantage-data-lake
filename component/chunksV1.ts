@@ -439,10 +439,26 @@ export const countChunks = query({
 //
 // NO `.paginate()` (illegal in a Convex Component — "paginate() is only
 // supported in the app") and NO unbounded `.collect()` (0.4.1 already proved
-// it raises past ~16MB). Each call reads `.take(pageSize)` rows strictly
-// after `bootstrap_cursor` (exclusive, via `.gt("chunk_id", ...)`), advances
+// it raises past ~16MB). Each call walks the index range strictly after
+// `bootstrap_cursor` (exclusive, via `.gt("chunk_id", ...)`), advances
 // `count` and `bootstrap_cursor` together in the SAME transaction, and
 // returns. The caller loops until `done: true`.
+//
+// BYTE-BUDGETED, not row-count-bounded (Pi finding, measured on prod —
+// deployment logs: "Uncaught Error: Too many bytes read in a single
+// function execution (limit: 16777216 bytes)" on a real scope). A fixed
+// `.take(pageSize)` of 500 rows still materializes WHOLE `chunks` documents
+// (the large `text` field included) purely to COUNT them — 500 voluminous
+// legal rulings cross 16MiB just as easily as the single `.collect()` the
+// write-time counter was built to avoid in 0.4.1. Convex has no field
+// projection and no server-side COUNT, so a bootstrap that only needs to
+// count still materializes whole documents; the only lever against the
+// 16 MiB per-execution read limit is bounding the BYTES read per call, not
+// a fixed row count. Budget 8 MiB gives ~2x headroom under the 16MiB hard
+// limit, absorbing `JSON.stringify` estimation error. `MAX_ROWS_PER_PAGE`
+// stays as a secondary safety cap (also under Convex's per-query
+// document-scan limit) for scopes with many small rows, where the byte
+// budget alone would never trip.
 //
 // Idempotent per page and safe to re-fire: a repeated call for a row already
 // `status:"ready"` is a no-op (returns immediately, never re-walks or
@@ -457,10 +473,17 @@ export const countChunks = query({
 // The same guard also disambiguates `row === null` (DELTA 4): a scope with
 // pre-existing unmeasured rows is stamped "bootstrapping" and its first
 // write is refused, rather than being poisoned into a false "ready" 1.
+const MAX_PAGE_BYTES = 8 * 1024 * 1024; // 8 MiB — ~2x headroom under the 16MiB hard limit.
+const DEFAULT_MAX_ROWS_PER_PAGE = 4096;
+
 export const bootstrapScopeCount = mutation({
 	args: {
 		orgId: v.string(),
 		scope: v.string(),
+		// REPURPOSED (byte-budget fix): no longer a fixed page size read via
+		// `.take()` — now a secondary safety cap on rows-per-call, alongside
+		// the primary MAX_PAGE_BYTES budget. Same arg name, same call-site
+		// shape, different meaning.
 		pageSize: v.optional(v.number()),
 	},
 	returns: v.object({
@@ -471,7 +494,7 @@ export const bootstrapScopeCount = mutation({
 	}),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		const pageSize = args.pageSize ?? 500;
+		const maxRows = args.pageSize ?? DEFAULT_MAX_ROWS_PER_PAGE;
 
 		let row = await ctx.db
 			.query("chunk_scope_counts")
@@ -505,25 +528,43 @@ export const bootstrapScopeCount = mutation({
 		}
 
 		const cursor = row.bootstrap_cursor ?? "";
-		const page = await ctx.db
+
+		// Byte-budgeted iteration: stop as soon as EITHER bound trips —
+		// bytesSoFar >= MAX_PAGE_BYTES (the primary defense against the real
+		// 16MiB per-execution read limit) OR processed >= maxRows (secondary
+		// safety cap). `for await` over the index range never materializes
+		// more than one page's worth of documents at a time in this loop's
+		// own accounting, and the underlying index scan is still strictly
+		// bounded by the `.gt(cursor)` range — no `.collect()`, no
+		// `.paginate()`.
+		let processed = 0;
+		let bytesSoFar = 0;
+		let lastKey = cursor;
+		for await (const doc of ctx.db
 			.query("chunks")
 			.withIndex("by_org_scope_chunk", (q) =>
 				q.eq("orgId", args.orgId).eq("scope", args.scope).gt("chunk_id", cursor),
-			)
-			.take(pageSize);
+			)) {
+			bytesSoFar += JSON.stringify(doc).length;
+			processed += 1;
+			lastKey = doc.chunk_id;
+			if (bytesSoFar >= MAX_PAGE_BYTES || processed >= maxRows) {
+				break;
+			}
+		}
 
-		if (page.length === 0) {
-			// An empty first page means the scope was walked and genuinely
-			// holds nothing — ready-0 here is a MEASURED zero, semantically
-			// distinct from the unmeasured-scope throw in countChunks;
-			// bootstrap is the deliberate measurement act that earns it.
+		if (processed === 0) {
+			// No rows past the cursor means the scope was walked and
+			// genuinely holds nothing — ready-0 here is a MEASURED zero,
+			// semantically distinct from the unmeasured-scope throw in
+			// countChunks; bootstrap is the deliberate measurement act that
+			// earns it.
 			await ctx.db.patch(row._id, { status: "ready" });
 			return { done: true, processed: 0, total: row.count, cursor };
 		}
 
-		const newTotal = row.count + page.length;
-		const newCursor = page[page.length - 1].chunk_id;
-		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: newCursor });
-		return { done: false, processed: page.length, total: newTotal, cursor: newCursor };
+		const newTotal = row.count + processed;
+		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: lastKey });
+		return { done: false, processed, total: newTotal, cursor: lastKey };
 	},
 });

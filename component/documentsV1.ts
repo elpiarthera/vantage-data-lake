@@ -374,17 +374,36 @@ export const countDocuments = query({
 
 // bootstrapDocumentScopeCount — mirrors chunksV1.bootstrapScopeCount 1:1 for
 // the `documents` table, walking via `by_org_scope_document` and advancing
-// the cursor on `document_id`. Same bounded-page, no-`.paginate()`,
-// no-unbounded-`.collect()`, resumable, idempotent-per-page contract.
+// the cursor on `document_id`. Same no-`.paginate()`, no-unbounded-
+// `.collect()`, resumable, idempotent-per-page contract.
+//
+// BYTE-BUDGETED, not row-count-bounded (Pi finding, measured on prod —
+// deployment logs: "Uncaught Error: Too many bytes read in a single
+// function execution (limit: 16777216 bytes)" on a real scope, same class
+// as chunksV1.bootstrapScopeCount). Convex has no field projection and no
+// server-side COUNT, so a bootstrap that only needs to count still
+// materializes whole documents; the only lever against the 16 MiB
+// per-execution read limit is bounding the BYTES read per call, not a
+// fixed row count. Budget 8 MiB gives ~2x headroom under the 16MiB hard
+// limit, absorbing `JSON.stringify` estimation error. `MAX_ROWS_PER_PAGE`
+// stays as a secondary safety cap for scopes with many small rows.
+//
 // Quiescence during bootstrap is ENFORCED (coordinator DELTA 2/4, mirrors
 // chunksV1): insertDocuments/deleteDocument both refuse a write to a
 // "bootstrapping" scope via `ensureDocumentScopeMeasuredForWrite`, which
 // also disambiguates `row === null` between "born here" and "historical
 // unmeasured scope" via a single `.take(1)` on the data table.
+const MAX_PAGE_BYTES = 8 * 1024 * 1024; // 8 MiB — ~2x headroom under the 16MiB hard limit.
+const DEFAULT_MAX_ROWS_PER_PAGE = 4096;
+
 export const bootstrapDocumentScopeCount = mutation({
 	args: {
 		orgId: v.string(),
 		scope: v.string(),
+		// REPURPOSED (byte-budget fix): no longer a fixed page size read via
+		// `.take()` — now a secondary safety cap on rows-per-call, alongside
+		// the primary MAX_PAGE_BYTES budget. Same arg name, same call-site
+		// shape, different meaning.
 		pageSize: v.optional(v.number()),
 	},
 	returns: v.object({
@@ -395,7 +414,7 @@ export const bootstrapDocumentScopeCount = mutation({
 	}),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		const pageSize = args.pageSize ?? 500;
+		const maxRows = args.pageSize ?? DEFAULT_MAX_ROWS_PER_PAGE;
 
 		let row = await ctx.db
 			.query("document_scope_counts")
@@ -429,28 +448,41 @@ export const bootstrapDocumentScopeCount = mutation({
 		}
 
 		const cursor = row.bootstrap_cursor ?? "";
-		const page = await ctx.db
+
+		// Byte-budgeted iteration — see chunksV1.bootstrapScopeCount's
+		// comment for the full rationale; identical logic, `document_id`
+		// cursor instead of `chunk_id`.
+		let processed = 0;
+		let bytesSoFar = 0;
+		let lastKey = cursor;
+		for await (const doc of ctx.db
 			.query("documents")
 			.withIndex("by_org_scope_document", (q) =>
 				q
 					.eq("orgId", args.orgId)
 					.eq("scope", args.scope)
 					.gt("document_id", cursor),
-			)
-			.take(pageSize);
+			)) {
+			bytesSoFar += JSON.stringify(doc).length;
+			processed += 1;
+			lastKey = doc.document_id;
+			if (bytesSoFar >= MAX_PAGE_BYTES || processed >= maxRows) {
+				break;
+			}
+		}
 
-		if (page.length === 0) {
-			// An empty first page means the scope was walked and genuinely
-			// holds nothing — ready-0 here is a MEASURED zero, semantically
-			// distinct from the unmeasured-scope throw in countDocuments;
-			// bootstrap is the deliberate measurement act that earns it.
+		if (processed === 0) {
+			// No rows past the cursor means the scope was walked and
+			// genuinely holds nothing — ready-0 here is a MEASURED zero,
+			// semantically distinct from the unmeasured-scope throw in
+			// countDocuments; bootstrap is the deliberate measurement act
+			// that earns it.
 			await ctx.db.patch(row._id, { status: "ready" });
 			return { done: true, processed: 0, total: row.count, cursor };
 		}
 
-		const newTotal = row.count + page.length;
-		const newCursor = page[page.length - 1].document_id;
-		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: newCursor });
-		return { done: false, processed: page.length, total: newTotal, cursor: newCursor };
+		const newTotal = row.count + processed;
+		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: lastKey });
+		return { done: false, processed, total: newTotal, cursor: lastKey };
 	},
 });

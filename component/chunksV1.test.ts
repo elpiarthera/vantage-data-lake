@@ -1017,4 +1017,85 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 		expect(count).toBe(2);
 	});
+
+	// Directly inserts rows with a LARGE `text` field, simulating the prod
+	// defect Pi measured: "Uncaught Error: Too many bytes read in a single
+	// function execution (limit: 16777216 bytes)" — a fixed pageSize=500
+	// `.take()` still materializes whole documents purely to count them, and
+	// voluminous legal-ruling text crosses 16MiB well under 500 rows.
+	async function seedLargeHistoricalChunks(
+		t: ReturnType<typeof createT>,
+		orgId: string,
+		scope: string,
+		n: number,
+		textBytes: number,
+	) {
+		const bigText = "x".repeat(textBytes);
+		await t.run(async (ctx) => {
+			const now = Date.now();
+			for (let i = 0; i < n; i++) {
+				await ctx.db.insert("chunks", {
+					orgId,
+					scope,
+					chunk_id: `big-${String(i).padStart(5, "0")}`,
+					text: bigText,
+					legal_references: [],
+					source_ref: `src/big-${i}`,
+					createdAt: now,
+				});
+			}
+		});
+	}
+
+	// CAVEAT (stated per coordinator's TESTS instruction): convex-test does
+	// NOT enforce the real Convex runtime's 16MiB-per-execution read limit —
+	// this suite proves the page-breaks-by-BYTES LOGIC (a round stops at the
+	// MAX_PAGE_BYTES budget, well before exhausting the rows available), NOT
+	// that it avoids the real 16MiB limit on a live deployment. That
+	// endpoint proof (bootstrapping a large-doc scope on a real deployment
+	// without the throw) is a post-merge step, cited then.
+	test("byte-budgeted bootstrap: a page breaks on BYTES (not on running out of rows) for large-text historical chunks; final total exact, no double-count on resume", async () => {
+		const t = createT();
+		// Each row ~= 300KB of `text` (well under 8MiB alone) — 40 rows push
+		// well past the 8MiB MAX_PAGE_BYTES budget while still leaving rows
+		// unconsumed, forcing the loop to break on bytes, not on exhausting
+		// the index range.
+		const N = 40;
+		const textBytes = 300 * 1024;
+		await seedLargeHistoricalChunks(t, "org-bytebudget", "bytebudget-scope", N, textBytes);
+
+		const first = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-bytebudget",
+			scope: "bytebudget-scope",
+		});
+		expect(first.done).toBe(false);
+		// The defining assertion: this round's processed count is LESS than
+		// the total historical rows — the loop broke on the byte budget, not
+		// because it ran out of rows to read.
+		expect(first.processed).toBeGreaterThan(0);
+		expect(first.processed).toBeLessThan(N);
+
+		let result = first;
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-bytebudget",
+				scope: "bytebudget-scope",
+			});
+			iterations += 1;
+			if (iterations > 50) throw new Error("byte-budget bootstrap loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+		// Multiple rounds were required — this call did NOT collect
+		// everything in one page (proving the budget, not a row cap, drove
+		// the split, since N=40 is well under DEFAULT_MAX_ROWS_PER_PAGE=4096).
+		expect(iterations).toBeGreaterThan(1);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-bytebudget",
+			scope: "bytebudget-scope",
+		});
+		expect(count).toBe(N);
+	});
 });

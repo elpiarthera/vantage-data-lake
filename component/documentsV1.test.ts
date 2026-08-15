@@ -872,4 +872,78 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 		expect(count).toBe(2);
 	});
+
+	// Mirrors chunksV1.test.ts's byte-budget suite 1:1 — see that file's
+	// comment for the full rationale (Pi's measured prod defect: "Uncaught
+	// Error: Too many bytes read in a single function execution (limit:
+	// 16777216 bytes)").
+	async function seedLargeHistoricalDocuments(
+		t: ReturnType<typeof createT>,
+		orgId: string,
+		scope: string,
+		n: number,
+		textBytes: number,
+	) {
+		const bigText = "x".repeat(textBytes);
+		await t.run(async (ctx) => {
+			const now = Date.now();
+			for (let i = 0; i < n; i++) {
+				await ctx.db.insert("documents", {
+					orgId,
+					scope,
+					document_id: `big-doc-${String(i).padStart(5, "0")}`,
+					text: bigText,
+					createdAt: now,
+				});
+			}
+		});
+	}
+
+	// CAVEAT (stated per coordinator's TESTS instruction): convex-test does
+	// NOT enforce the real Convex runtime's 16MiB-per-execution read limit —
+	// this suite proves the page-breaks-by-BYTES LOGIC (a round stops at the
+	// MAX_PAGE_BYTES budget, well before exhausting the rows available), NOT
+	// that it avoids the real 16MiB limit on a live deployment. That
+	// endpoint proof (bootstrapping a large-doc scope on a real deployment
+	// without the throw) is a post-merge step, cited then.
+	test("byte-budgeted bootstrap: a page breaks on BYTES (not on running out of rows) for large-text historical documents; final total exact, no double-count on resume", async () => {
+		const t = createT();
+		const N = 40;
+		const textBytes = 300 * 1024;
+		await seedLargeHistoricalDocuments(
+			t,
+			"org-bytebudget-docs",
+			"bytebudget-scope",
+			N,
+			textBytes,
+		);
+
+		const first = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-bytebudget-docs",
+			scope: "bytebudget-scope",
+		});
+		expect(first.done).toBe(false);
+		expect(first.processed).toBeGreaterThan(0);
+		expect(first.processed).toBeLessThan(N);
+
+		let result = first;
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+				orgId: "org-bytebudget-docs",
+				scope: "bytebudget-scope",
+			});
+			iterations += 1;
+			if (iterations > 50) throw new Error("byte-budget bootstrap loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+		expect(iterations).toBeGreaterThan(1);
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-bytebudget-docs",
+			scope: "bytebudget-scope",
+		});
+		expect(count).toBe(N);
+	});
 });

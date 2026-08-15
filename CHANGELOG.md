@@ -1,5 +1,37 @@
 # @vantageos/data-lake — Changelog
 
+## 0.4.6 — 2026-08-15 — fix: byte-budgeted bootstrap (fixed pageSize=500 still blew the 16MiB read limit)
+
+**Root cause, measured firsthand on prod deployment logs.** `bootstrapScopeCount` threw on a
+real prod scope (`jurisprudence-ca-null`): `Uncaught Error: Too many bytes read in a single
+function execution (limit: 16777216 bytes)`. `bootstrapScopeCount`'s `.take(pageSize=500)`
+materializes WHOLE `chunks` documents (the large `text` field included) purely to COUNT them
+— 500 voluminous legal rulings cross 16MiB well under the row cap. It is the SAME 16MiB
+byte-read the write-time counter (0.4.1) was built to avoid, reappearing in the bootstrap
+path that reconciles historical (pre-counter) scopes. Same shape confirmed in
+`bootstrapDocumentScopeCount` — both fixed in this release.
+
+**Fix — bound the page by BYTES, not by a fixed row count.** Convex has no field projection
+and no server-side COUNT, so a bootstrap that only needs to count still materializes whole
+documents; the only lever against the 16 MiB per-execution read limit is bounding the BYTES
+read per call, not a fixed row count. Budget 8 MiB gives ~2x headroom. Both bootstrap
+mutations now walk the index range with `for await` (still no `.paginate()`, still no
+unbounded `.collect()`), accumulating `bytesSoFar` via `JSON.stringify(doc).length` per row
+and breaking the loop when `bytesSoFar >= 8 MiB` OR `processed >= maxRows` (a secondary
+row-count safety cap, `pageSize` arg repurposed, default 4096). Count and cursor still
+advance together in the same transaction — idempotency-per-page is unchanged.
+
+**Tests.** New byte-budget test in both `chunksV1.test.ts` and `documentsV1.test.ts`: seeds
+historical rows with large (~300KB) `text` fields, bootstraps to completion in MULTIPLE
+rounds, and asserts a round's `processed` count is strictly less than the total historical
+rows — proving the page broke on the byte budget, not on exhausting the index range. Final
+total is exact, no double-count on resume. **Caveat (stated, not hidden):** `convex-test`
+does NOT enforce the real Convex runtime's 16MiB-per-execution read limit — the suite proves
+the page-breaks-by-BYTES LOGIC, not that it avoids the real limit on a live deployment; that
+endpoint proof is a post-merge step, cited then.
+
+Task k170kqsam.
+
 ## 0.4.5 — 2026-08-15 — fix: structured ConvexError payloads for every consumer-reachable refusal
 
 **Root cause (Pi + operator finding).** The write-time-counter refusal work (0.4.3-0.4.4,
