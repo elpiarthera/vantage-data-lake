@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { mutation, query, internalMutation } from "./_generated/server";
 import {
 	memoryTypeValidator,
@@ -95,9 +95,11 @@ export const storeMemory = mutation({
 		// loud at the boundary instead of silently dropping. See E.0 ADR — host
 		// is responsible for embedding compute (Components cannot use "use node").
 		if (args.embedding === undefined) {
-			throw new Error(
-				"embedding required — host must compute via aiClient.embed before storeMemory call. See ADR Phase E.0 + README contract.",
-			);
+			throw new ConvexError({
+				code: "embedding_required" as const,
+				message:
+					"embedding required — host must compute via aiClient.embed before storeMemory call. See ADR Phase E.0 + README contract.",
+			});
 		}
 
 		const now = Date.now();
@@ -363,7 +365,11 @@ export const softDeleteMemory = mutation({
 	handler: async (ctx, args) => {
 		const memory = await ctx.db.get(args.memoryId);
 		if (memory === null) {
-			throw new Error(`Memory ${args.memoryId} not found`);
+			throw new ConvexError({
+				code: "memory_not_found" as const,
+				id: args.memoryId,
+				message: `Memory ${args.memoryId} not found`,
+			});
 		}
 
 		await ctx.db.patch(args.memoryId, { isLatest: false, updatedAt: Date.now() });
@@ -399,7 +405,12 @@ export const validateIds = query({
 	}),
 	handler: async (ctx, args) => {
 		if (args.ids.length > 100) {
-			throw new Error(`too_many_ids: cap=100, got=${args.ids.length}`);
+			throw new ConvexError({
+				code: "too_many_ids" as const,
+				cap: 100,
+				got: args.ids.length,
+				message: `too_many_ids: cap=100, got=${args.ids.length}`,
+			});
 		}
 
 		const valid: string[] = [];
