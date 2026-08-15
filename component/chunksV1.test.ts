@@ -284,20 +284,20 @@ describe("component/chunksV1.ts — insertChunks + searchCorpus (BM25-only, no e
 	});
 });
 
-// ── countChunks — in-base count, read FROM THE DATABASE, never from what was
-// sent (derive-never-type: insertChunks's return is "chunks processed by this
-// call", NOT a corpus-completeness proof). countChunks answers "how many rows
-// actually exist for (orgId, scope) right now", filtered via the same
-// by_org_scope_chunk index insertChunks/searchCorpus already use — never an
-// unfiltered/global scan.
+// ── countChunks — O(1) READ FROM THE WRITE-TIME COUNTER
+// (`chunk_scope_counts`), never a scan of the `chunks` table itself.
 //
-// RED (recorded verbatim, captured against this repo BEFORE
-// component/chunksV1.ts exported countChunks):
-//
-//   FAIL  component/chunksV1.test.ts [ component/chunksV1.test.ts ]
-//   TypeError: api.chunksV1.countChunks is not a function
-//   -- every test in this describe block failed at call time, because
-//   countChunks did not exist on chunksV1 yet.
+// REBUILT (this file): the prior version of this suite proved exactness via
+// `.paginate()`-based accumulation, which convex-test PERMITS but the real
+// component runtime FORBIDS outright — "paginate() is only supported in the
+// app", raised on every scope, empty or not (measured by Talos on prod
+// proficient-rabbit-316 and dev dashing-ermine-394; call sites confirmed by
+// Pi). The 32/32 green suite that motivated this rebuild was a FALSE green
+// for exactly that reason. This suite now proves the COUNTER's own
+// exactness/idempotency/isolation/delete-decrement contract — it does NOT,
+// and cannot, prove the code runs on a real component deployment; convex-test
+// is strictly more permissive than the component runtime. That activation
+// proof is a live call on a real deployment, done separately.
 describe("component/chunksV1.ts — countChunks (in-base count, isolation + exactness proof)", () => {
 	test("countChunks(A) never counts B's rows — isolation across scope, same orgId", async () => {
 		const t = createT();
@@ -444,15 +444,15 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 		expect(secondCount).toBe(N);
 	});
 
-	test("empty scope — countChunks on a non-existent (orgId, scope) returns 0, no error", async () => {
+	test("unmeasured scope — countChunks on a non-existent (orgId, scope) THROWS, never a silent 0", async () => {
 		const t = createT();
 
-		const count = await t.query(api.chunksV1.countChunks, {
-			orgId: "org-never-seeded",
-			scope: "scope-never-seeded",
-		});
-
-		expect(count).toBe(0);
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-never-seeded",
+				scope: "scope-never-seeded",
+			}),
+		).rejects.toThrow(/not initialized/i);
 	});
 
 	test("countChunks refuses an empty orgId — deny by default, same guard as insertChunks/searchCorpus", async () => {
@@ -475,48 +475,477 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 		).rejects.toThrow(/scope/i);
 	});
 
-	// Multi-page accumulation proof (0.4.1 — VP task
-	// k171tdmy8xwx8ss0yckae0pdbn8cfxad): countChunks's internal page size is
-	// 500 rows/page. Inserting 2.5x that (1250 rows) into ONE (orgId, scope)
-	// forces the paged read to cross AT LEAST two page boundaries before
-	// countChunks can return — a first-page-only or single-`.collect()`
-	// implementation would either under-report (first page only) or, on a
-	// real deployment past the byte ceiling, raise instead of returning.
-	//
-	// RED (recorded verbatim, captured against a first-page-only stub
-	// implementation of countChunks BEFORE the paginate-cursor-loop landed):
-	//
-	//   FAIL  component/chunksV1.test.ts > countChunks (in-base count...)
-	//     > countChunks accumulates the EXACT total across multiple pages
-	//   AssertionError: expected 500 to be 1250
-	//    + Expected: 1250
-	//    - Actual:   500
-	//   -- a first-page-only read returned only the first
-	//   COUNT_CHUNKS_PAGE_SIZE rows and stopped, proving the paging loop
-	//   (not just a single page) is load-bearing for exactness at scale.
-	test("countChunks accumulates the EXACT total across multiple pages (2.5x page size, one scope)", async () => {
+	test("countChunks stays O(1)-correct at N=1250 (well past any prior page-size boundary) — counter, not a scan", async () => {
 		const t = createT();
 
-		const PAGE_SIZE = 500;
-		const N = Math.floor(PAGE_SIZE * 2.5); // 1250 — crosses >= 2 page boundaries
+		const N = 1250;
 		const chunks = Array.from({ length: N }, (_, i) => ({
-			chunk_id: `paged-${i}`,
-			text: `Paged accumulation chunk number ${i}.`,
+			chunk_id: `bulk-${i}`,
+			text: `Bulk counter chunk number ${i}.`,
 			legal_references: [],
-			source_ref: `src/paged-${i}`,
+			source_ref: `src/bulk-${i}`,
 		}));
 
 		await t.mutation(api.chunksV1.insertChunks, {
-			orgId: "org-paged",
-			scope: "paged-scope",
+			orgId: "org-bulk",
+			scope: "bulk-scope",
 			chunks,
 		});
 
 		const count = await t.query(api.chunksV1.countChunks, {
-			orgId: "org-paged",
-			scope: "paged-scope",
+			orgId: "org-bulk",
+			scope: "bulk-scope",
 		});
 
 		expect(count).toBe(N);
+	});
+
+	test("deleteChunk decrements the counter by exactly 1, and never below 0", async () => {
+		const t = createT();
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-del",
+			scope: "del-scope",
+			chunks: [
+				{
+					chunk_id: "del-1",
+					text: "To be deleted.",
+					legal_references: [],
+					source_ref: "src/del-1",
+				},
+				{
+					chunk_id: "del-2",
+					text: "Stays.",
+					legal_references: [],
+					source_ref: "src/del-2",
+				},
+			],
+		});
+
+		expect(
+			await t.query(api.chunksV1.countChunks, {
+				orgId: "org-del",
+				scope: "del-scope",
+			}),
+		).toBe(2);
+
+		const deleted = await t.mutation(api.chunksV1.deleteChunk, {
+			orgId: "org-del",
+			scope: "del-scope",
+			chunk_id: "del-1",
+		});
+		expect(deleted).toBe(true);
+
+		expect(
+			await t.query(api.chunksV1.countChunks, {
+				orgId: "org-del",
+				scope: "del-scope",
+			}),
+		).toBe(1);
+
+		// Deleting an already-absent chunk_id is a no-op — false, count
+		// unchanged, never raises, never goes negative.
+		const deletedAgain = await t.mutation(api.chunksV1.deleteChunk, {
+			orgId: "org-del",
+			scope: "del-scope",
+			chunk_id: "del-1",
+		});
+		expect(deletedAgain).toBe(false);
+
+		expect(
+			await t.query(api.chunksV1.countChunks, {
+				orgId: "org-del",
+				scope: "del-scope",
+			}),
+		).toBe(1);
+
+		// Delete the last remaining row — counter reaches 0, never negative.
+		await t.mutation(api.chunksV1.deleteChunk, {
+			orgId: "org-del",
+			scope: "del-scope",
+			chunk_id: "del-2",
+		});
+		expect(
+			await t.query(api.chunksV1.countChunks, {
+				orgId: "org-del",
+				scope: "del-scope",
+			}),
+		).toBe(0);
+	});
+});
+
+// ── bootstrapScopeCount — historical-scope reconciliation (Eta REVISE,
+// PR #11 @616e8197: countChunks returning 0 on an unmeasured scope is a
+// silent lie; this suite proves the refuse-then-bootstrap-then-authoritative
+// lifecycle, RED before the fix existed).
+describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refuse->bootstrap->authoritative)", () => {
+	// Directly inserts rows into `chunks` bypassing insertChunks, simulating
+	// the 144283 historical rows written before the write-time counter
+	// existed — no `chunk_scope_counts` row is ever created for them.
+	async function seedHistoricalChunks(
+		t: ReturnType<typeof createT>,
+		orgId: string,
+		scope: string,
+		n: number,
+	) {
+		await t.run(async (ctx) => {
+			const now = Date.now();
+			for (let i = 0; i < n; i++) {
+				await ctx.db.insert("chunks", {
+					orgId,
+					scope,
+					chunk_id: `hist-${String(i).padStart(5, "0")}`,
+					text: `Historical chunk ${i}, written before the counter existed.`,
+					legal_references: [],
+					source_ref: `src/hist-${i}`,
+					createdAt: now,
+				});
+			}
+		});
+	}
+
+	test("BEFORE bootstrap: countChunks throws on a scope with historical (pre-counter) rows — never a silent 0", async () => {
+		const t = createT();
+		await seedHistoricalChunks(t, "org-hist", "hist-scope", 12);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-hist",
+				scope: "hist-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+	});
+
+	test("bootstrapScopeCount walks a historical scope to completion; total === N; countChunks then returns N", async () => {
+		const t = createT();
+		const N = 137;
+		await seedHistoricalChunks(t, "org-boot", "boot-scope", N);
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-boot",
+			scope: "boot-scope",
+			pageSize: 25,
+		});
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-boot",
+				scope: "boot-scope",
+				pageSize: 25,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("bootstrap loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-boot",
+			scope: "boot-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("a scope seeded via insertChunks (status ready from row zero) needs NO bootstrap — countChunks works immediately", async () => {
+		const t = createT();
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-live",
+			scope: "live-scope",
+			chunks: [
+				{
+					chunk_id: "live-1",
+					text: "Live-ingested chunk, never touched bootstrap.",
+					legal_references: [],
+					source_ref: "src/live-1",
+				},
+			],
+		});
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-live",
+			scope: "live-scope",
+		});
+		expect(count).toBe(1);
+	});
+
+	test("idempotence — bootstrapScopeCount called again after done:true returns {done:true, total:N} and does not change the count", async () => {
+		const t = createT();
+		const N = 40;
+		await seedHistoricalChunks(t, "org-idem", "idem-scope", N);
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-idem",
+				scope: "idem-scope",
+				pageSize: 500,
+			});
+		}
+		expect(result.total).toBe(N);
+
+		const again = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		expect(again).toEqual({ done: true, processed: 0, total: N, cursor: "" });
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("empty-but-ready scope (bootstrapped with zero historical rows) returns 0 legitimately", async () => {
+		const t = createT();
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-empty-ready",
+			scope: "empty-ready-scope",
+		});
+		expect(result).toEqual({ done: true, processed: 0, total: 0, cursor: "" });
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-empty-ready",
+			scope: "empty-ready-scope",
+		});
+		expect(count).toBe(0);
+	});
+
+	test("mid-bootstrap: countChunks throws while status is still bootstrapping (partial walk, not yet done)", async () => {
+		const t = createT();
+		const N = 60;
+		await seedHistoricalChunks(t, "org-partial", "partial-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-partial",
+			scope: "partial-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-partial",
+				scope: "partial-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
+	});
+
+	test("interrupted then resumed bootstrap — stops before done, countChunks throws in the interval, resuming reaches exact total with no double-count and no loss", async () => {
+		const t = createT();
+		const N = 97;
+		await seedHistoricalChunks(t, "org-resume", "resume-scope", N);
+
+		// First call only — deliberately NOT looped to completion.
+		const interrupted = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-resume",
+			scope: "resume-scope",
+			pageSize: 20,
+		});
+		expect(interrupted.done).toBe(false);
+		expect(interrupted.total).toBeLessThan(N);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-resume",
+				scope: "resume-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
+
+		// Resume to completion.
+		let result = interrupted;
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-resume",
+				scope: "resume-scope",
+				pageSize: 20,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("resume loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-resume",
+			scope: "resume-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("insertChunks refuses a write to a bootstrapping scope — write-race class closed, not merely documented", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalChunks(t, "org-race", "race-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-race",
+			scope: "race-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: "org-race",
+				scope: "race-scope",
+				chunks: [
+					{
+						chunk_id: "race-new",
+						text: "Racing an in-progress bootstrap.",
+						legal_references: [],
+						source_ref: "src/race-new",
+					},
+				],
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("deleteChunk refuses a delete on a bootstrapping scope", async () => {
+		const t = createT();
+		const N = 30;
+		await seedHistoricalChunks(t, "org-race-del", "race-del-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-race-del",
+			scope: "race-del-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.mutation(api.chunksV1.deleteChunk, {
+				orgId: "org-race-del",
+				scope: "race-del-scope",
+				chunk_id: "hist-00000",
+			}),
+		).rejects.toThrow(/bootstrapping/i);
+	});
+
+	test("insertChunks on a ready scope passes and increments normally", async () => {
+		const t = createT();
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+			chunks: [
+				{
+					chunk_id: "seed-1",
+					text: "Seeds a ready scope.",
+					legal_references: [],
+					source_ref: "src/seed-1",
+				},
+			],
+		});
+
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+			chunks: [
+				{
+					chunk_id: "seed-2",
+					text: "Second write to an already-ready scope.",
+					legal_references: [],
+					source_ref: "src/seed-2",
+				},
+			],
+		});
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-ready-write",
+			scope: "ready-write-scope",
+		});
+		expect(count).toBe(2);
+	});
+
+	test("ETA-PROBE2: a scope with N=10 pre-existing (historical, un-bootstrapped) rows THROWS on the first insertChunks call — never a false ready-1", async () => {
+		const t = createT();
+		await seedHistoricalChunks(t, "org-eta-probe2", "eta-probe2-scope", 10);
+
+		await expect(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+				chunks: [
+					{
+						chunk_id: "eta-probe2-new",
+						text: "First live write onto a historical, un-bootstrapped scope.",
+						legal_references: [],
+						source_ref: "src/eta-probe2-new",
+					},
+				],
+			}),
+		).rejects.toThrow(/pre-existing unmeasured rows/i);
+
+		// countChunks still throws — no false-ready-1 was ever stamped.
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+
+		// Bootstrap is required and, once run to completion, is authoritative
+		// at N=10 (the historical rows) — the refused insert never landed.
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-eta-probe2",
+			scope: "eta-probe2-scope",
+		});
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+			});
+		}
+		expect(result.total).toBe(10);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-eta-probe2",
+			scope: "eta-probe2-scope",
+		});
+		expect(count).toBe(10);
+	});
+
+	test("fresh-scope order trap — two successive insertChunks calls on a brand-new scope both pass; countChunks returns the sum, no throw", async () => {
+		const t = createT();
+
+		const first = await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+			chunks: [
+				{
+					chunk_id: "trap-1",
+					text: "First call on a scope that has never existed before.",
+					legal_references: [],
+					source_ref: "src/trap-1",
+				},
+			],
+		});
+		expect(first).toBe(1);
+
+		const second = await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+			chunks: [
+				{
+					chunk_id: "trap-2",
+					text: "Second call — the scope is now ready.",
+					legal_references: [],
+					source_ref: "src/trap-2",
+				},
+			],
+		});
+		expect(second).toBe(1);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+		});
+		expect(count).toBe(2);
 	});
 });

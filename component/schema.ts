@@ -131,6 +131,11 @@ export default defineSchema({
 		legal_references: v.array(v.string()),
 		source_ref: v.string(),
 		createdAt: v.number(),
+		// Optional link to a parent `documents` row (see below). Added
+		// additively (VP task k170e3tygkh99a83kj3b72xbed8cf5cf) — every
+		// existing chunk row (no document_id) stays valid, and
+		// insertChunks/countChunks/searchCorpus are untouched by this field.
+		document_id: v.optional(v.string()),
 	})
 		// Row listing / test assertions scoped to (orgId, scope).
 		.index("by_org_scope", ["orgId", "scope"])
@@ -143,4 +148,71 @@ export default defineSchema({
 			searchField: "text",
 			filterFields: ["orgId", "scope"],
 		}),
+
+	// ── documents ───────────────────────────────────────────────────────────────
+	// Additive documents layer (VP task k170e3tygkh99a83kj3b72xbed8cf5cf).
+	// A DOCUMENT is the whole-source entity (e.g. one court ruling); `chunks`
+	// rows may optionally point back to a document via `document_id` for a
+	// future fine-grained RAG passage layer. This table does NOT replace or
+	// modify `chunks` — a consumer may keep storing 1 document = 1 chunk, or
+	// adopt documents + passage-chunks, both remain valid simultaneously.
+	//
+	// Same isolation axis and conventions as `chunks`: (orgId, scope)
+	// caller-supplied (never `ctx.auth`), deny by default via requireOrgScope,
+	// orgId first in every index.
+	documents: defineTable({
+		orgId: v.string(),
+		scope: v.string(),
+		document_id: v.string(),
+		text: v.string(),
+		title: v.optional(v.string()),
+		source_ref: v.optional(v.string()),
+		legal_references: v.optional(v.array(v.string())),
+		createdAt: v.number(),
+	})
+		// Row listing / test assertions scoped to (orgId, scope).
+		.index("by_org_scope", ["orgId", "scope"])
+		// Upsert + point lookup by (orgId, scope, document_id) — deny by
+		// default, isolation fields first. Mirrors chunks' by_org_scope_chunk.
+		.index("by_org_scope_document", ["orgId", "scope", "document_id"]),
+
+	// ── chunk_scope_counts / document_scope_counts ─────────────────────────────
+	// Write-time counters for corpus-completeness reads. A Convex COMPONENT
+	// forbids `.paginate()` — "paginate() is only supported in the app" —
+	// which raises on every scope, empty or not (measured by Talos on prod
+	// proficient-rabbit-316 and dev dashing-ermine-394; call sites confirmed
+	// by Pi). `.collect()` is likewise banned here (0.4.1 already proved it
+	// raises past ~16MB). The fix is structural, not a bigger page size: never
+	// scan the data table for a count. Each (orgId, scope) pair owns exactly
+	// one counter row here, maintained by the insert/delete mutation that
+	// changes the underlying table — countChunks/countDocuments become a
+	// single indexed point lookup, O(1) regardless of corpus size.
+	chunk_scope_counts: defineTable({
+		org_id: v.string(),
+		scope: v.string(),
+		count: v.number(),
+		// Additive (Eta REVISE, PR #11 @616e8197): a counter row created by a
+		// LIVE insert on a fresh scope is authoritative from row zero
+		// (status:"ready"). A counter row created by `bootstrapScopeCount` for
+		// a scope with pre-counter history starts "bootstrapping" and flips to
+		// "ready" only once the whole data table has been walked. `undefined`
+		// (pre-existing rows written before this field existed) is treated the
+		// same as absent — countChunks refuses rather than guessing.
+		status: v.optional(v.union(v.literal("bootstrapping"), v.literal("ready"))),
+		// Last `chunk_id` processed by the bootstrap walk (exclusive lower
+		// bound for the next page) — "" until the first page runs.
+		bootstrap_cursor: v.optional(v.string()),
+	})
+		// Isolation fields first, deny by default — same convention as
+		// chunks/documents' by_org_scope indexes.
+		.index("by_org_scope", ["org_id", "scope"]),
+
+	document_scope_counts: defineTable({
+		org_id: v.string(),
+		scope: v.string(),
+		count: v.number(),
+		status: v.optional(v.union(v.literal("bootstrapping"), v.literal("ready"))),
+		bootstrap_cursor: v.optional(v.string()),
+	})
+		.index("by_org_scope", ["org_id", "scope"]),
 });
