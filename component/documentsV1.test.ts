@@ -723,4 +723,84 @@ describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical s
 		});
 		expect(count).toBe(2);
 	});
+
+	test("ETA-PROBE2: a scope with N=10 pre-existing (historical, un-bootstrapped) rows THROWS on the first insertDocuments call — never a false ready-1", async () => {
+		const t = createT();
+		await seedHistoricalDocuments(t, "org-eta-probe2-docs", "eta-probe2-scope", 10);
+
+		await expect(
+			t.mutation(api.documentsV1.insertDocuments, {
+				orgId: "org-eta-probe2-docs",
+				scope: "eta-probe2-scope",
+				documents: [
+					{
+						document_id: "eta-probe2-new",
+						text: "First live write onto a historical, un-bootstrapped scope.",
+					},
+				],
+			}),
+		).rejects.toThrow(/pre-existing unmeasured rows/i);
+
+		// countDocuments still throws — no false-ready-1 was ever stamped.
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-eta-probe2-docs",
+				scope: "eta-probe2-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+
+		// Bootstrap is required and, once run to completion, is authoritative
+		// at N=10 (the historical rows) — the refused insert never landed.
+		let result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-eta-probe2-docs",
+			scope: "eta-probe2-scope",
+		});
+		while (!result.done) {
+			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+				orgId: "org-eta-probe2-docs",
+				scope: "eta-probe2-scope",
+			});
+		}
+		expect(result.total).toBe(10);
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-eta-probe2-docs",
+			scope: "eta-probe2-scope",
+		});
+		expect(count).toBe(10);
+	});
+
+	test("fresh-scope order trap — two successive insertDocuments calls on a brand-new scope both pass; countDocuments returns the sum, no throw", async () => {
+		const t = createT();
+
+		const first = await t.mutation(api.documentsV1.insertDocuments, {
+			orgId: "org-order-trap-docs",
+			scope: "order-trap-scope",
+			documents: [
+				{
+					document_id: "trap-1",
+					text: "First call on a scope that has never existed before.",
+				},
+			],
+		});
+		expect(first).toBe(1);
+
+		const second = await t.mutation(api.documentsV1.insertDocuments, {
+			orgId: "org-order-trap-docs",
+			scope: "order-trap-scope",
+			documents: [
+				{
+					document_id: "trap-2",
+					text: "Second call — the scope is now ready.",
+				},
+			],
+		});
+		expect(second).toBe(1);
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-order-trap-docs",
+			scope: "order-trap-scope",
+		});
+		expect(count).toBe(2);
+	});
 });

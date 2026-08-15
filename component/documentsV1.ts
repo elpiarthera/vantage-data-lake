@@ -39,11 +39,16 @@ function requireOrgScope(orgId: string, scope: string): void {
 	}
 }
 
-// incrementDocumentScopeCount / decrementDocumentScopeCount — write-time
-// counter maintenance for `document_scope_counts`. Mirrors chunksV1's
-// incrementChunkScopeCount/decrementChunkScopeCount 1:1: get-then-patch via
-// `by_org_scope`, called ONLY from the genuine-insert / genuine-delete
-// branches so idempotency lives at the call site.
+// incrementDocumentScopeCount — write-time counter maintenance for
+// `document_scope_counts`. Mirrors chunksV1's incrementChunkScopeCount 1:1:
+// get-then-patch via `by_org_scope`, called ONLY from the genuine-insert
+// branch so idempotency lives at the call site.
+//
+// By the time this runs, `ensureDocumentScopeMeasuredForWrite` (below) has
+// ALREADY run at the top of insertDocuments and guarantees a "ready"
+// counter row exists — the `row === null` create-branch that used to live
+// here is now DEAD on the insertDocuments path. A missing row here is a
+// loud, defensive throw rather than a silent re-creation.
 async function incrementDocumentScopeCount(
 	ctx: MutationCtx,
 	orgId: string,
@@ -56,26 +61,24 @@ async function incrementDocumentScopeCount(
 		)
 		.unique();
 	if (row === null) {
-		// A scope that starts life under the write-time-counter code has no
-		// pre-counter history to reconcile — it is authoritative from row
-		// zero. Only the BOOTSTRAP path (below) touches historical scopes.
-		await ctx.db.insert("document_scope_counts", {
-			org_id: orgId,
-			scope,
-			count: 1,
-			status: "ready",
-		});
-	} else {
-		await ctx.db.patch(row._id, { count: row.count + 1 });
+		throw new Error(
+			"increment: counter row missing — ensureDocumentScopeMeasuredForWrite must run first",
+		);
 	}
+	await ctx.db.patch(row._id, { count: row.count + 1 });
 }
 
-// requireDocumentsNotBootstrapping — mirrors chunksV1's
-// requireNotBootstrapping 1:1 (coordinator DELTA 2): insertDocuments and
-// deleteDocument load the counter row FIRST and refuse a write outright
-// when it is mid-bootstrap, closing the write-race class instead of
-// merely documenting it as a precondition.
-async function requireDocumentsNotBootstrapping(
+// ensureDocumentScopeMeasuredForWrite — mirrors chunksV1's
+// ensureScopeMeasuredForWrite 1:1 (REPLACES the earlier
+// requireDocumentsNotBootstrapping guard, it subsumes it). Closes the
+// subtler defect Eta caught in REVISE round 2 on dac3f49: `row === null` at
+// the top of a write is AMBIGUOUS between "a fresh scope, born under this
+// code" and "a historical scope with pre-existing rows never bootstrapped."
+// One O(1) `.take(1)` on the DATA table separates the two meanings, run
+// BEFORE any insert this call makes: empty ⇒ the scope genuinely begins
+// here, create the counter row ready-0; non-empty ⇒ historical unmeasured
+// scope, create the counter row "bootstrapping" and REFUSE this write.
+async function ensureDocumentScopeMeasuredForWrite(
 	ctx: MutationCtx,
 	orgId: string,
 	scope: string,
@@ -85,11 +88,55 @@ async function requireDocumentsNotBootstrapping(
 		.query("document_scope_counts")
 		.withIndex("by_org_scope", (q) => q.eq("org_id", orgId).eq("scope", scope))
 		.unique();
-	if (row !== null && row.status === "bootstrapping") {
-		throw new Error(
-			`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
-		);
+
+	if (row !== null) {
+		if (row.status === "bootstrapping") {
+			throw new Error(
+				`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+			);
+		}
+		// status === "ready" — already measured, proceed.
+		return;
 	}
+
+	// row === null — disambiguate via a single bounded take(1) on the data
+	// table, the ONLY question that separates "born here" from
+	// "un-bootstrapped history": did this scope already contain rows?
+	const existingPage = await ctx.db
+		.query("documents")
+		.withIndex("by_org_scope_document", (q) =>
+			q.eq("orgId", orgId).eq("scope", scope),
+		)
+		.take(1);
+
+	if (existingPage.length === 0) {
+		// Genuinely begins here — authoritative from row zero.
+		await ctx.db.insert("document_scope_counts", {
+			org_id: orgId,
+			scope,
+			count: 0,
+			status: "ready",
+			bootstrap_cursor: "",
+		});
+		return;
+	}
+
+	// Historical unmeasured scope — refuse the write outright. As in
+	// chunksV1's mirror, the `ctx.db.insert` below documents intent but a
+	// Convex mutation is transactional: throwing after it rolls the whole
+	// handler back, so nothing persists — the throw is the real guard, and
+	// the scope stays UNMEASURED (no row) until bootstrapDocumentScopeCount
+	// creates it.
+	await ctx.db.insert("document_scope_counts", {
+		org_id: orgId,
+		scope,
+		count: 0,
+		status: "bootstrapping",
+		bootstrap_cursor: "",
+	});
+	throw new Error(
+		`${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapDocumentScopeCount first`,
+	);
 }
 
 // decrementDocumentScopeCount — never below 0; a missing counter row is
@@ -128,7 +175,7 @@ export const insertDocuments = mutation({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		await requireDocumentsNotBootstrapping(ctx, args.orgId, args.scope, "insertDocuments");
+		await ensureDocumentScopeMeasuredForWrite(ctx, args.orgId, args.scope, "insertDocuments");
 		const now = Date.now();
 		for (const document of args.documents) {
 			const existing = await ctx.db
@@ -231,7 +278,7 @@ export const deleteDocument = mutation({
 	returns: v.boolean(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		await requireDocumentsNotBootstrapping(ctx, args.orgId, args.scope, "deleteDocument");
+		await ensureDocumentScopeMeasuredForWrite(ctx, args.orgId, args.scope, "deleteDocument");
 		const existing = await ctx.db
 			.query("documents")
 			.withIndex("by_org_scope_document", (q) =>
@@ -301,9 +348,11 @@ export const countDocuments = query({
 // the `documents` table, walking via `by_org_scope_document` and advancing
 // the cursor on `document_id`. Same bounded-page, no-`.paginate()`,
 // no-unbounded-`.collect()`, resumable, idempotent-per-page contract.
-// Quiescence during bootstrap is ENFORCED (coordinator DELTA 2, mirrors
+// Quiescence during bootstrap is ENFORCED (coordinator DELTA 2/4, mirrors
 // chunksV1): insertDocuments/deleteDocument both refuse a write to a
-// "bootstrapping" scope via `requireDocumentsNotBootstrapping`.
+// "bootstrapping" scope via `ensureDocumentScopeMeasuredForWrite`, which
+// also disambiguates `row === null` between "born here" and "historical
+// unmeasured scope" via a single `.take(1)` on the data table.
 export const bootstrapDocumentScopeCount = mutation({
 	args: {
 		orgId: v.string(),

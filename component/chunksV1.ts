@@ -58,12 +58,21 @@ function requireOrgScope(orgId: string, scope: string): void {
 	}
 }
 
-// incrementChunkScopeCount / decrementChunkScopeCount — write-time counter
-// maintenance for `chunk_scope_counts`. Get-then-patch via the
-// `by_org_scope` index (isolation fields first). Called ONLY from the
-// genuine-insert branch (never the update/upsert branch) so a re-upsert of
-// an existing chunk_id never moves the counter — idempotency lives at the
-// call site (insertChunks' existing new-vs-existing branch), not here.
+// incrementChunkScopeCount — write-time counter maintenance for
+// `chunk_scope_counts`. Get-then-patch via the `by_org_scope` index
+// (isolation fields first). Called ONLY from the genuine-insert branch
+// (never the update/upsert branch) so a re-upsert of an existing chunk_id
+// never moves the counter — idempotency lives at the call site
+// (insertChunks' existing new-vs-existing branch), not here.
+//
+// By the time this runs, `ensureScopeMeasuredForWrite` (below) has ALREADY
+// run at the top of insertChunks and guarantees a "ready" counter row
+// exists for (orgId, scope) — so the `row === null` create-branch that used
+// to live here is now DEAD on the insertChunks path and would only fire on
+// a genuine bug (a call site that skipped the guard). Rather than silently
+// re-creating a "ready" row in that case — which is exactly the false-
+// measured-integer defect this round of REVISE closes — a missing row here
+// is a loud, defensive throw.
 async function incrementChunkScopeCount(
 	ctx: MutationCtx,
 	orgId: string,
@@ -76,29 +85,32 @@ async function incrementChunkScopeCount(
 		)
 		.unique();
 	if (row === null) {
-		// A scope that starts life under the write-time-counter code has no
-		// pre-counter history to reconcile — it is authoritative from row
-		// zero. Only the BOOTSTRAP path (below) touches historical scopes.
-		await ctx.db.insert("chunk_scope_counts", {
-			org_id: orgId,
-			scope,
-			count: 1,
-			status: "ready",
-		});
-	} else {
-		await ctx.db.patch(row._id, { count: row.count + 1 });
+		throw new Error(
+			"increment: counter row missing — ensureScopeMeasuredForWrite must run first",
+		);
 	}
+	await ctx.db.patch(row._id, { count: row.count + 1 });
 }
 
-// requireNotBootstrapping — closes the write-race class instead of merely
-// documenting it as a precondition (coordinator DELTA 2, follow-up to Eta
-// REVISE PR #11 @616e8197): a write racing an in-progress bootstrap walk
-// could land behind the walk's cursor and be silently swallowed, or land
-// ahead of it and be double-counted once the walk resumes. Both
-// insertChunks and deleteChunk load the counter row FIRST and refuse
-// outright when it is mid-bootstrap; a fresh scope (no row) or an already
-// "ready" scope proceeds exactly as before.
-async function requireNotBootstrapping(
+// ensureScopeMeasuredForWrite — REPLACES the earlier requireNotBootstrapping
+// guard (it subsumes it) and closes a subtler defect Eta caught in REVISE
+// round 2 on dac3f49: `row === null` at the top of a write is AMBIGUOUS — it
+// means EITHER "a fresh scope, born under this code, with zero history" OR
+// "a historical scope with pre-existing rows that were never bootstrapped."
+// Stamping the former's answer (status:"ready") onto the latter produces a
+// false measured integer (e.g. countChunks = 1 for a scope that actually
+// holds 10001 rows) that is WORSE than the visible 0 this whole fix started
+// from, because bootstrapScopeCount then treats "ready" as its own
+// idempotent no-op and never runs.
+//
+// One O(1) `.take(1)` on the DATA table separates the two meanings, run
+// BEFORE any insert this call makes: empty ⇒ the scope genuinely begins
+// here, create the counter row ready-0 (the normal genuine-insert path then
+// increments it to N); non-empty ⇒ historical unmeasured scope, create the
+// counter row "bootstrapping" and REFUSE this write outright — the loader
+// of a historical scope is stopped at its first write instead of poisoning
+// the counter, and is told to run bootstrapScopeCount first.
+async function ensureScopeMeasuredForWrite(
 	ctx: MutationCtx,
 	orgId: string,
 	scope: string,
@@ -108,11 +120,57 @@ async function requireNotBootstrapping(
 		.query("chunk_scope_counts")
 		.withIndex("by_org_scope", (q) => q.eq("org_id", orgId).eq("scope", scope))
 		.unique();
-	if (row !== null && row.status === "bootstrapping") {
-		throw new Error(
-			`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
-		);
+
+	if (row !== null) {
+		if (row.status === "bootstrapping") {
+			throw new Error(
+				`${opName}: refusing a write to org=${orgId} scope=${scope} while its counter is bootstrapping — retry after bootstrap completes`,
+			);
+		}
+		// status === "ready" — already measured, proceed.
+		return;
 	}
+
+	// row === null — disambiguate via a single bounded take(1) on the data
+	// table, the ONLY question that separates "born here" from
+	// "un-bootstrapped history": did this scope already contain rows?
+	const existingPage = await ctx.db
+		.query("chunks")
+		.withIndex("by_org_scope_chunk", (q) =>
+			q.eq("orgId", orgId).eq("scope", scope),
+		)
+		.take(1);
+
+	if (existingPage.length === 0) {
+		// Genuinely begins here — authoritative from row zero.
+		await ctx.db.insert("chunk_scope_counts", {
+			org_id: orgId,
+			scope,
+			count: 0,
+			status: "ready",
+			bootstrap_cursor: "",
+		});
+		return;
+	}
+
+	// Historical unmeasured scope — refuse the write outright rather than
+	// stamping a false-ready 1. The `ctx.db.insert` below documents intent
+	// (a "bootstrapping" marker row) but a Convex mutation is transactional:
+	// throwing after it rolls the whole handler back, so nothing persists —
+	// the call site's throw is the actual, observable guard, and the scope
+	// is left exactly as it was found (no row at all, i.e. still
+	// UNMEASURED). `countChunks` keeps throwing "not initialized" until
+	// `bootstrapScopeCount` is run, which creates the row itself.
+	await ctx.db.insert("chunk_scope_counts", {
+		org_id: orgId,
+		scope,
+		count: 0,
+		status: "bootstrapping",
+		bootstrap_cursor: "",
+	});
+	throw new Error(
+		`${opName}: org=${orgId} scope=${scope} has pre-existing unmeasured rows — run bootstrapScopeCount first`,
+	);
 }
 
 // decrementChunkScopeCount — never below 0; a missing counter row is treated
@@ -154,7 +212,7 @@ export const insertChunks = mutation({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		await requireNotBootstrapping(ctx, args.orgId, args.scope, "insertChunks");
+		await ensureScopeMeasuredForWrite(ctx, args.orgId, args.scope, "insertChunks");
 		const now = Date.now();
 		for (const chunk of args.chunks) {
 			const existing = await ctx.db
@@ -212,7 +270,7 @@ export const deleteChunk = mutation({
 	returns: v.boolean(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
-		await requireNotBootstrapping(ctx, args.orgId, args.scope, "deleteChunk");
+		await ensureScopeMeasuredForWrite(ctx, args.orgId, args.scope, "deleteChunk");
 		const existing = await ctx.db
 			.query("chunks")
 			.withIndex("by_org_scope_chunk", (q) =>
@@ -359,9 +417,12 @@ export const countChunks = query({
 //
 // Quiescence during bootstrap is now ENFORCED, not merely documented:
 // insertChunks/deleteChunk both refuse a write to a "bootstrapping" scope
-// via `requireNotBootstrapping` (coordinator DELTA 2) — the write-race class
-// this comment used to describe as an unenforced precondition no longer
-// exists; a caller gets a loud, named throw instead of a silent race.
+// via `ensureScopeMeasuredForWrite` (coordinator DELTA 2/4) — the write-race
+// class this comment used to describe as an unenforced precondition no
+// longer exists; a caller gets a loud, named throw instead of a silent race.
+// The same guard also disambiguates `row === null` (DELTA 4): a scope with
+// pre-existing unmeasured rows is stamped "bootstrapping" and its first
+// write is refused, rather than being poisoned into a false "ready" 1.
 export const bootstrapScopeCount = mutation({
 	args: {
 		orgId: v.string(),

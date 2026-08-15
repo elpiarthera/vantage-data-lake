@@ -862,4 +862,90 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		});
 		expect(count).toBe(2);
 	});
+
+	test("ETA-PROBE2: a scope with N=10 pre-existing (historical, un-bootstrapped) rows THROWS on the first insertChunks call — never a false ready-1", async () => {
+		const t = createT();
+		await seedHistoricalChunks(t, "org-eta-probe2", "eta-probe2-scope", 10);
+
+		await expect(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+				chunks: [
+					{
+						chunk_id: "eta-probe2-new",
+						text: "First live write onto a historical, un-bootstrapped scope.",
+						legal_references: [],
+						source_ref: "src/eta-probe2-new",
+					},
+				],
+			}),
+		).rejects.toThrow(/pre-existing unmeasured rows/i);
+
+		// countChunks still throws — no false-ready-1 was ever stamped.
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+
+		// Bootstrap is required and, once run to completion, is authoritative
+		// at N=10 (the historical rows) — the refused insert never landed.
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-eta-probe2",
+			scope: "eta-probe2-scope",
+		});
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-eta-probe2",
+				scope: "eta-probe2-scope",
+			});
+		}
+		expect(result.total).toBe(10);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-eta-probe2",
+			scope: "eta-probe2-scope",
+		});
+		expect(count).toBe(10);
+	});
+
+	test("fresh-scope order trap — two successive insertChunks calls on a brand-new scope both pass; countChunks returns the sum, no throw", async () => {
+		const t = createT();
+
+		const first = await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+			chunks: [
+				{
+					chunk_id: "trap-1",
+					text: "First call on a scope that has never existed before.",
+					legal_references: [],
+					source_ref: "src/trap-1",
+				},
+			],
+		});
+		expect(first).toBe(1);
+
+		const second = await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+			chunks: [
+				{
+					chunk_id: "trap-2",
+					text: "Second call — the scope is now ready.",
+					legal_references: [],
+					source_ref: "src/trap-2",
+				},
+			],
+		});
+		expect(second).toBe(1);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-order-trap",
+			scope: "order-trap-scope",
+		});
+		expect(count).toBe(2);
+	});
 });
