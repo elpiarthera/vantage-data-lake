@@ -32,6 +32,20 @@ endpoint proof is a post-merge step, cited then.
 
 Task k170kqsam.
 
+**Docs clarification (same 0.4.6 republish, reviewer + coordinator finding, measured firsthand
+on the deployment).** The 0.4.5 `ConvexError` work is correct but the README claim
+"errors are now structured / no more Server Error" was INACCURATE and would mislead an
+integrator: a Convex client surfaces a caught `ConvexError` as TWO fields —
+`errorMessage` (ALWAYS `"[Request ID: ...] Server Error"`, unchanged, tells the client
+nothing) and `errorData` (the structured `{code, orgId, scope, message}` payload). Only
+`errorData` carries the code; a client reading `errorMessage` (the field named "message",
+the one most integrators reach for first) still sees the opaque string and learns nothing.
+README now states explicitly: **read `errorData.code`; `errorMessage` will say
+`[Request ID: ...] Server Error` and that is expected** — with a byte-for-byte live example
+captured over the public `/api/query` endpoint and the code list derived from source via
+`grep -hoE 'code: "[a-z_]+"' component/*.ts | sort -u` (command shown alongside the list, not
+hand-typed).
+
 ## 0.4.5 — 2026-08-15 — fix: structured ConvexError payloads for every consumer-reachable refusal
 
 **Root cause (Pi + operator finding).** The write-time-counter refusal work (0.4.3-0.4.4,
