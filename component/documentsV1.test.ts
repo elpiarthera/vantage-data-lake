@@ -140,11 +140,17 @@ describe("component/documentsV1.ts — insertDocuments + getDocument (upsert, by
 		});
 		expect(crossTenantDoc).toBeNull();
 
-		const crossTenantCount = await t.query(api.documentsV1.countDocuments, {
-			orgId: "org-other",
-			scope: "jurisprudence",
-		});
-		expect(crossTenantCount).toBe(0);
+		// org-other/jurisprudence was never seeded — an unmeasured scope
+		// throws rather than returning a silent 0 (Eta REVISE, PR #11
+		// @616e8197). Isolation is still proven: the throw carries no leak of
+		// org-secret's count, and the positive control below confirms
+		// org-secret's own count is exact.
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-other",
+				scope: "jurisprudence",
+			}),
+		).rejects.toThrow(/not initialized/i);
 
 		// POSITIVE CONTROL — the owning org DOES see its own document.
 		const ownDoc = await t.query(api.documentsV1.getDocument, {
@@ -324,15 +330,15 @@ describe("component/documentsV1.ts — countDocuments (write-time counter, exact
 		).toBe(0);
 	});
 
-	test("countDocuments on a non-existent (orgId, scope) returns 0, no error", async () => {
+	test("unmeasured scope — countDocuments on a non-existent (orgId, scope) THROWS, never a silent 0", async () => {
 		const t = createT();
 
-		const count = await t.query(api.documentsV1.countDocuments, {
-			orgId: "org-never-seeded-docs",
-			scope: "scope-never-seeded-docs",
-		});
-
-		expect(count).toBe(0);
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-never-seeded-docs",
+				scope: "scope-never-seeded-docs",
+			}),
+		).rejects.toThrow(/not initialized/i);
 	});
 
 	test("countDocuments refuses an empty orgId — deny by default", async () => {
@@ -438,5 +444,163 @@ describe("component/schema.ts — chunks.document_id (optional link, additive-on
 		);
 		expect(row).not.toBeNull();
 		expect(row?.document_id).toBeUndefined();
+	});
+});
+
+// ── bootstrapDocumentScopeCount — historical-scope reconciliation (Eta
+// REVISE, PR #11 @616e8197, mirrored 1:1 from chunksV1's suite).
+describe("component/documentsV1.ts — bootstrapDocumentScopeCount (historical scopes, refuse->bootstrap->authoritative)", () => {
+	// Directly inserts rows into `documents` bypassing insertDocuments,
+	// simulating historical rows written before the write-time counter
+	// existed — no `document_scope_counts` row is ever created for them.
+	async function seedHistoricalDocuments(
+		t: ReturnType<typeof createT>,
+		orgId: string,
+		scope: string,
+		n: number,
+	) {
+		await t.run(async (ctx) => {
+			const now = Date.now();
+			for (let i = 0; i < n; i++) {
+				await ctx.db.insert("documents", {
+					orgId,
+					scope,
+					document_id: `hist-doc-${String(i).padStart(5, "0")}`,
+					text: `Historical document ${i}, written before the counter existed.`,
+					createdAt: now,
+				});
+			}
+		});
+	}
+
+	test("BEFORE bootstrap: countDocuments throws on a scope with historical (pre-counter) rows — never a silent 0", async () => {
+		const t = createT();
+		await seedHistoricalDocuments(t, "org-hist-docs", "hist-scope", 12);
+
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-hist-docs",
+				scope: "hist-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+	});
+
+	test("bootstrapDocumentScopeCount walks a historical scope to completion; total === N; countDocuments then returns N", async () => {
+		const t = createT();
+		const N = 137;
+		await seedHistoricalDocuments(t, "org-boot-docs", "boot-scope", N);
+
+		let result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-boot-docs",
+			scope: "boot-scope",
+			pageSize: 25,
+		});
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+				orgId: "org-boot-docs",
+				scope: "boot-scope",
+				pageSize: 25,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("bootstrap loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-boot-docs",
+			scope: "boot-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("a scope seeded via insertDocuments (status ready from row zero) needs NO bootstrap — countDocuments works immediately", async () => {
+		const t = createT();
+		await t.mutation(api.documentsV1.insertDocuments, {
+			orgId: "org-live-docs",
+			scope: "live-scope",
+			documents: [
+				{
+					document_id: "live-1",
+					text: "Live-ingested document, never touched bootstrap.",
+				},
+			],
+		});
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-live-docs",
+			scope: "live-scope",
+		});
+		expect(count).toBe(1);
+	});
+
+	test("idempotence — bootstrapDocumentScopeCount called again after done:true returns {done:true, total:N} and does not change the count", async () => {
+		const t = createT();
+		const N = 40;
+		await seedHistoricalDocuments(t, "org-idem-docs", "idem-scope", N);
+
+		let result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-idem-docs",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		while (!result.done) {
+			result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+				orgId: "org-idem-docs",
+				scope: "idem-scope",
+				pageSize: 500,
+			});
+		}
+		expect(result.total).toBe(N);
+
+		const again = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-idem-docs",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		expect(again).toEqual({ done: true, processed: 0, total: N, cursor: "" });
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-idem-docs",
+			scope: "idem-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("empty-but-ready scope (bootstrapped with zero historical rows) returns 0 legitimately", async () => {
+		const t = createT();
+
+		const result = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-empty-ready-docs",
+			scope: "empty-ready-scope",
+		});
+		expect(result).toEqual({ done: true, processed: 0, total: 0, cursor: "" });
+
+		const count = await t.query(api.documentsV1.countDocuments, {
+			orgId: "org-empty-ready-docs",
+			scope: "empty-ready-scope",
+		});
+		expect(count).toBe(0);
+	});
+
+	test("mid-bootstrap: countDocuments throws while status is still bootstrapping (partial walk, not yet done)", async () => {
+		const t = createT();
+		const N = 60;
+		await seedHistoricalDocuments(t, "org-partial-docs", "partial-scope", N);
+
+		const partial = await t.mutation(api.documentsV1.bootstrapDocumentScopeCount, {
+			orgId: "org-partial-docs",
+			scope: "partial-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.query(api.documentsV1.countDocuments, {
+				orgId: "org-partial-docs",
+				scope: "partial-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
 	});
 });

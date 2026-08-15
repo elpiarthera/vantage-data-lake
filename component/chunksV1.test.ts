@@ -444,15 +444,15 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 		expect(secondCount).toBe(N);
 	});
 
-	test("empty scope — countChunks on a non-existent (orgId, scope) returns 0, no error", async () => {
+	test("unmeasured scope — countChunks on a non-existent (orgId, scope) THROWS, never a silent 0", async () => {
 		const t = createT();
 
-		const count = await t.query(api.chunksV1.countChunks, {
-			orgId: "org-never-seeded",
-			scope: "scope-never-seeded",
-		});
-
-		expect(count).toBe(0);
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-never-seeded",
+				scope: "scope-never-seeded",
+			}),
+		).rejects.toThrow(/not initialized/i);
 	});
 
 	test("countChunks refuses an empty orgId — deny by default, same guard as insertChunks/searchCorpus", async () => {
@@ -571,5 +571,169 @@ describe("component/chunksV1.ts — countChunks (in-base count, isolation + exac
 				scope: "del-scope",
 			}),
 		).toBe(0);
+	});
+});
+
+// ── bootstrapScopeCount — historical-scope reconciliation (Eta REVISE,
+// PR #11 @616e8197: countChunks returning 0 on an unmeasured scope is a
+// silent lie; this suite proves the refuse-then-bootstrap-then-authoritative
+// lifecycle, RED before the fix existed).
+describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refuse->bootstrap->authoritative)", () => {
+	// Directly inserts rows into `chunks` bypassing insertChunks, simulating
+	// the 144283 historical rows written before the write-time counter
+	// existed — no `chunk_scope_counts` row is ever created for them.
+	async function seedHistoricalChunks(
+		t: ReturnType<typeof createT>,
+		orgId: string,
+		scope: string,
+		n: number,
+	) {
+		await t.run(async (ctx) => {
+			const now = Date.now();
+			for (let i = 0; i < n; i++) {
+				await ctx.db.insert("chunks", {
+					orgId,
+					scope,
+					chunk_id: `hist-${String(i).padStart(5, "0")}`,
+					text: `Historical chunk ${i}, written before the counter existed.`,
+					legal_references: [],
+					source_ref: `src/hist-${i}`,
+					createdAt: now,
+				});
+			}
+		});
+	}
+
+	test("BEFORE bootstrap: countChunks throws on a scope with historical (pre-counter) rows — never a silent 0", async () => {
+		const t = createT();
+		await seedHistoricalChunks(t, "org-hist", "hist-scope", 12);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-hist",
+				scope: "hist-scope",
+			}),
+		).rejects.toThrow(/not initialized/i);
+	});
+
+	test("bootstrapScopeCount walks a historical scope to completion; total === N; countChunks then returns N", async () => {
+		const t = createT();
+		const N = 137;
+		await seedHistoricalChunks(t, "org-boot", "boot-scope", N);
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-boot",
+			scope: "boot-scope",
+			pageSize: 25,
+		});
+		let iterations = 1;
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-boot",
+				scope: "boot-scope",
+				pageSize: 25,
+			});
+			iterations += 1;
+			if (iterations > 100) throw new Error("bootstrap loop did not converge");
+		}
+
+		expect(result.total).toBe(N);
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-boot",
+			scope: "boot-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("a scope seeded via insertChunks (status ready from row zero) needs NO bootstrap — countChunks works immediately", async () => {
+		const t = createT();
+		await t.mutation(api.chunksV1.insertChunks, {
+			orgId: "org-live",
+			scope: "live-scope",
+			chunks: [
+				{
+					chunk_id: "live-1",
+					text: "Live-ingested chunk, never touched bootstrap.",
+					legal_references: [],
+					source_ref: "src/live-1",
+				},
+			],
+		});
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-live",
+			scope: "live-scope",
+		});
+		expect(count).toBe(1);
+	});
+
+	test("idempotence — bootstrapScopeCount called again after done:true returns {done:true, total:N} and does not change the count", async () => {
+		const t = createT();
+		const N = 40;
+		await seedHistoricalChunks(t, "org-idem", "idem-scope", N);
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		while (!result.done) {
+			result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+				orgId: "org-idem",
+				scope: "idem-scope",
+				pageSize: 500,
+			});
+		}
+		expect(result.total).toBe(N);
+
+		const again = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+			pageSize: 500,
+		});
+		expect(again).toEqual({ done: true, processed: 0, total: N, cursor: "" });
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-idem",
+			scope: "idem-scope",
+		});
+		expect(count).toBe(N);
+	});
+
+	test("empty-but-ready scope (bootstrapped with zero historical rows) returns 0 legitimately", async () => {
+		const t = createT();
+
+		let result = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-empty-ready",
+			scope: "empty-ready-scope",
+		});
+		expect(result).toEqual({ done: true, processed: 0, total: 0, cursor: "" });
+
+		const count = await t.query(api.chunksV1.countChunks, {
+			orgId: "org-empty-ready",
+			scope: "empty-ready-scope",
+		});
+		expect(count).toBe(0);
+	});
+
+	test("mid-bootstrap: countChunks throws while status is still bootstrapping (partial walk, not yet done)", async () => {
+		const t = createT();
+		const N = 60;
+		await seedHistoricalChunks(t, "org-partial", "partial-scope", N);
+
+		const partial = await t.mutation(api.chunksV1.bootstrapScopeCount, {
+			orgId: "org-partial",
+			scope: "partial-scope",
+			pageSize: 10,
+		});
+		expect(partial.done).toBe(false);
+
+		await expect(
+			t.query(api.chunksV1.countChunks, {
+				orgId: "org-partial",
+				scope: "partial-scope",
+			}),
+		).rejects.toThrow(/bootstrap in progress/i);
 	});
 });

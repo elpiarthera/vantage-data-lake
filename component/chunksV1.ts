@@ -76,10 +76,14 @@ async function incrementChunkScopeCount(
 		)
 		.unique();
 	if (row === null) {
+		// A scope that starts life under the write-time-counter code has no
+		// pre-counter history to reconcile — it is authoritative from row
+		// zero. Only the BOOTSTRAP path (below) touches historical scopes.
 		await ctx.db.insert("chunk_scope_counts", {
 			org_id: orgId,
 			scope,
 			count: 1,
+			status: "ready",
 		});
 	} else {
 		await ctx.db.patch(row._id, { count: row.count + 1 });
@@ -269,6 +273,16 @@ export const searchCorpus = query({
 // row via the `by_org_scope` index — one indexed point lookup, O(1)
 // regardless of corpus size, no `.paginate()`, no `.collect()`, no
 // `.take()`-loop.
+//
+// REFUSAL, not a silent 0 (Eta REVISE, PR #11 @616e8197): a scope with NO
+// counter row is UNMEASURED, not empty — 144283 historical rows were
+// written before this counter existed, via a path other than insertChunks,
+// and never touched `chunk_scope_counts`. Returning 0 for such a scope is
+// indistinguishable from a genuinely empty one and is a worse failure mode
+// than a crash: it is a confident, silent lie. countChunks now returns a
+// number ONLY for a row whose `status` is "ready" — i.e. either seeded by a
+// live insert (authoritative from row zero) or fully walked by
+// `bootstrapScopeCount`. Every other state throws, naming the fix.
 export const countChunks = query({
 	args: {
 		orgId: v.string(),
@@ -284,6 +298,100 @@ export const countChunks = query({
 				q.eq("org_id", args.orgId).eq("scope", args.scope),
 			)
 			.unique();
-		return row === null ? 0 : row.count;
+
+		if (row === null) {
+			throw new Error(
+				"countChunks: scope not initialized for (orgId,scope) — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first",
+			);
+		}
+		if (row.status !== "ready") {
+			throw new Error(
+				"countChunks: scope bootstrap in progress — count not yet authoritative",
+			);
+		}
+		return row.count;
+	},
+});
+
+// bootstrapScopeCount — walks the `chunks` table for a historical
+// (orgId, scope) pair ONE BOUNDED PAGE AT A TIME via the `by_org_scope_chunk`
+// composite index, seeding `chunk_scope_counts` so `countChunks` becomes
+// authoritative for rows written before the write-time counter existed.
+//
+// NO `.paginate()` (illegal in a Convex Component — "paginate() is only
+// supported in the app") and NO unbounded `.collect()` (0.4.1 already proved
+// it raises past ~16MB). Each call reads `.take(pageSize)` rows strictly
+// after `bootstrap_cursor` (exclusive, via `.gt("chunk_id", ...)`), advances
+// `count` and `bootstrap_cursor` together in the SAME transaction, and
+// returns. The caller loops until `done: true`.
+//
+// Idempotent per page and safe to re-fire: a repeated call for a row already
+// `status:"ready"` is a no-op (returns immediately, never re-walks or
+// double-counts); a repeated call mid-walk re-reads from the
+// already-advanced cursor, so no row is ever counted twice.
+//
+// PRECONDITION (not enforced, documented loudly): the scope MUST be
+// QUIESCENT during bootstrap — ingestion (insertChunks/deleteChunk) racing a
+// bootstrap walk on the SAME scope is out of contract; the walk assumes no
+// concurrent writes land behind its cursor while it runs.
+export const bootstrapScopeCount = mutation({
+	args: {
+		orgId: v.string(),
+		scope: v.string(),
+		pageSize: v.optional(v.number()),
+	},
+	returns: v.object({
+		done: v.boolean(),
+		processed: v.number(),
+		total: v.number(),
+		cursor: v.string(),
+	}),
+	handler: async (ctx, args) => {
+		requireOrgScope(args.orgId, args.scope);
+		const pageSize = args.pageSize ?? 500;
+
+		let row = await ctx.db
+			.query("chunk_scope_counts")
+			.withIndex("by_org_scope", (q) =>
+				q.eq("org_id", args.orgId).eq("scope", args.scope),
+			)
+			.unique();
+
+		if (row === null) {
+			const insertedId = await ctx.db.insert("chunk_scope_counts", {
+				org_id: args.orgId,
+				scope: args.scope,
+				count: 0,
+				status: "bootstrapping",
+				bootstrap_cursor: "",
+			});
+			row = await ctx.db.get(insertedId);
+			if (row === null) {
+				throw new Error("bootstrapScopeCount: failed to read back inserted counter row");
+			}
+		}
+
+		// Idempotent no-op — a ready scope is never re-bootstrapped.
+		if (row.status === "ready") {
+			return { done: true, processed: 0, total: row.count, cursor: "" };
+		}
+
+		const cursor = row.bootstrap_cursor ?? "";
+		const page = await ctx.db
+			.query("chunks")
+			.withIndex("by_org_scope_chunk", (q) =>
+				q.eq("orgId", args.orgId).eq("scope", args.scope).gt("chunk_id", cursor),
+			)
+			.take(pageSize);
+
+		if (page.length === 0) {
+			await ctx.db.patch(row._id, { status: "ready" });
+			return { done: true, processed: 0, total: row.count, cursor };
+		}
+
+		const newTotal = row.count + page.length;
+		const newCursor = page[page.length - 1].chunk_id;
+		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: newCursor });
+		return { done: false, processed: page.length, total: newTotal, cursor: newCursor };
 	},
 });

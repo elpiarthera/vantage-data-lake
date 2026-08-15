@@ -56,10 +56,14 @@ async function incrementDocumentScopeCount(
 		)
 		.unique();
 	if (row === null) {
+		// A scope that starts life under the write-time-counter code has no
+		// pre-counter history to reconcile — it is authoritative from row
+		// zero. Only the BOOTSTRAP path (below) touches historical scopes.
 		await ctx.db.insert("document_scope_counts", {
 			org_id: orgId,
 			scope,
 			count: 1,
+			status: "ready",
 		});
 	} else {
 		await ctx.db.patch(row._id, { count: row.count + 1 });
@@ -233,6 +237,12 @@ export const deleteDocument = mutation({
 // single counter row via the `by_org_scope` index — one indexed point
 // lookup, O(1) regardless of corpus size, no `.paginate()`, no
 // `.collect()`, no `.take()`-loop.
+//
+// REFUSAL, not a silent 0 (Eta REVISE, PR #11 @616e8197, mirrored from
+// chunksV1.countChunks): a scope with NO counter row is UNMEASURED, not
+// empty. countDocuments returns a number ONLY for a row whose `status` is
+// "ready" — seeded live (authoritative from row zero) or fully walked by
+// `bootstrapDocumentScopeCount`. Every other state throws.
 export const countDocuments = query({
 	args: {
 		orgId: v.string(),
@@ -248,6 +258,90 @@ export const countDocuments = query({
 				q.eq("org_id", args.orgId).eq("scope", args.scope),
 			)
 			.unique();
-		return row === null ? 0 : row.count;
+
+		if (row === null) {
+			throw new Error(
+				"countDocuments: scope not initialized for (orgId,scope) — refusing to return 0 on an unmeasured scope; run bootstrapDocumentScopeCount first",
+			);
+		}
+		if (row.status !== "ready") {
+			throw new Error(
+				"countDocuments: scope bootstrap in progress — count not yet authoritative",
+			);
+		}
+		return row.count;
+	},
+});
+
+// bootstrapDocumentScopeCount — mirrors chunksV1.bootstrapScopeCount 1:1 for
+// the `documents` table, walking via `by_org_scope_document` and advancing
+// the cursor on `document_id`. Same bounded-page, no-`.paginate()`,
+// no-unbounded-`.collect()`, resumable, idempotent-per-page contract.
+// PRECONDITION: the scope MUST be quiescent (no concurrent
+// insertDocuments/deleteDocument) during the walk.
+export const bootstrapDocumentScopeCount = mutation({
+	args: {
+		orgId: v.string(),
+		scope: v.string(),
+		pageSize: v.optional(v.number()),
+	},
+	returns: v.object({
+		done: v.boolean(),
+		processed: v.number(),
+		total: v.number(),
+		cursor: v.string(),
+	}),
+	handler: async (ctx, args) => {
+		requireOrgScope(args.orgId, args.scope);
+		const pageSize = args.pageSize ?? 500;
+
+		let row = await ctx.db
+			.query("document_scope_counts")
+			.withIndex("by_org_scope", (q) =>
+				q.eq("org_id", args.orgId).eq("scope", args.scope),
+			)
+			.unique();
+
+		if (row === null) {
+			const insertedId = await ctx.db.insert("document_scope_counts", {
+				org_id: args.orgId,
+				scope: args.scope,
+				count: 0,
+				status: "bootstrapping",
+				bootstrap_cursor: "",
+			});
+			row = await ctx.db.get(insertedId);
+			if (row === null) {
+				throw new Error(
+					"bootstrapDocumentScopeCount: failed to read back inserted counter row",
+				);
+			}
+		}
+
+		// Idempotent no-op — a ready scope is never re-bootstrapped.
+		if (row.status === "ready") {
+			return { done: true, processed: 0, total: row.count, cursor: "" };
+		}
+
+		const cursor = row.bootstrap_cursor ?? "";
+		const page = await ctx.db
+			.query("documents")
+			.withIndex("by_org_scope_document", (q) =>
+				q
+					.eq("orgId", args.orgId)
+					.eq("scope", args.scope)
+					.gt("document_id", cursor),
+			)
+			.take(pageSize);
+
+		if (page.length === 0) {
+			await ctx.db.patch(row._id, { status: "ready" });
+			return { done: true, processed: 0, total: row.count, cursor };
+		}
+
+		const newTotal = row.count + page.length;
+		const newCursor = page[page.length - 1].document_id;
+		await ctx.db.patch(row._id, { count: newTotal, bootstrap_cursor: newCursor });
+		return { done: false, processed: page.length, total: newTotal, cursor: newCursor };
 	},
 });

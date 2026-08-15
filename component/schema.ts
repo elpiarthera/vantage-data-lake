@@ -191,6 +191,17 @@ export default defineSchema({
 		org_id: v.string(),
 		scope: v.string(),
 		count: v.number(),
+		// Additive (Eta REVISE, PR #11 @616e8197): a counter row created by a
+		// LIVE insert on a fresh scope is authoritative from row zero
+		// (status:"ready"). A counter row created by `bootstrapScopeCount` for
+		// a scope with pre-counter history starts "bootstrapping" and flips to
+		// "ready" only once the whole data table has been walked. `undefined`
+		// (pre-existing rows written before this field existed) is treated the
+		// same as absent — countChunks refuses rather than guessing.
+		status: v.optional(v.union(v.literal("bootstrapping"), v.literal("ready"))),
+		// Last `chunk_id` processed by the bootstrap walk (exclusive lower
+		// bound for the next page) — "" until the first page runs.
+		bootstrap_cursor: v.optional(v.string()),
 	})
 		// Isolation fields first, deny by default — same convention as
 		// chunks/documents' by_org_scope indexes.
@@ -200,6 +211,8 @@ export default defineSchema({
 		org_id: v.string(),
 		scope: v.string(),
 		count: v.number(),
+		status: v.optional(v.union(v.literal("bootstrapping"), v.literal("ready"))),
+		bootstrap_cursor: v.optional(v.string()),
 	})
 		.index("by_org_scope", ["org_id", "scope"]),
 });
