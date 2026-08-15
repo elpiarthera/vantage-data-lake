@@ -1,6 +1,44 @@
 # @vantageos/data-lake — Changelog
 
-## 0.4.6 — 2026-08-15 — fix: byte-budgeted bootstrap (fixed pageSize=500 still blew the 16MiB read limit)
+## 0.4.7 — 2026-08-15 — fix: 0.4.6's "byte-budget" was a false fix — reverted to `.take(k)`, the only construct that bounds the runtime read
+
+**0.4.6 did not fix the defect it claimed to fix.** Measured firsthand by the coordinator on
+a real dev deployment (`dashing-ermine-394`): 25 counter-less rows of ~700 KB each, imported
+directly into `chunks` via `npx convex import --table chunks --component dataLake --append`
+(org `proof-org`, scope `byte-budget-proof`), then `corpus:bootstrapScopeCount` still threw
+`Uncaught Error: Too many bytes read in a single function execution (limit: 16777216 bytes)`
+at `component/chunksV1.ts:509`.
+
+**Root cause of the false fix.** A JS-side `break` over a `for await` iterator does NOT
+bound the bytes the Convex runtime reads — the iterator prefetches storage AHEAD of JS
+consumption, so accumulating `bytesSoFar` and breaking once it crossed the 8 MiB budget only
+stopped the LOOP; it never bounded the read the runtime had already issued underneath. 0.4.6
+removed the real `.take(pageSize)` (which DID bound runtime reads) and replaced it with an
+inert JS-side estimate.
+
+**Fix.** Reverted both `bootstrapScopeCount` and `bootstrapDocumentScopeCount` to a bounded
+`.take(k)` — the ONLY construct that limits what the Convex runtime actually reads in one
+execution, to exactly k documents. With Convex's 1 MiB max document size, `.take(k)` for
+k ≤ 15 is always safe regardless of document size; `SAFE_DEFAULT_PAGE = 8` reads at most
+~8 MiB in one execution, always under the 16 MiB per-execution read limit. `pageSize` stays
+overridable upward for a caller who KNOWS its documents are small (the throughput lever; the
+default is the safety floor). The `for await` loop, `MAX_PAGE_BYTES` const, and
+`JSON.stringify` byte estimation from 0.4.6 are removed entirely.
+
+**Tests.** Both bootstrap test suites rewritten to assert the deterministic `.take(k)`
+contract: a non-final round returns EXACTLY `pageSize` rows (not "fewer than the total," a
+byte-estimation-shaped assertion that 0.4.6's now-deleted logic could also have satisfied by
+coincidence). **Stated, not hidden:** `convex-test` does NOT enforce the real Convex
+runtime's 16MiB-per-execution read limit — the suite proves the `.take(k)`-bounded LOGIC
+(deterministic row counts per round), not that it avoids the real limit on a live deployment.
+That structurally follows from Convex's 1 MiB max document size × k ≤ 15, but the actual
+endpoint proof is re-staging on the dev deployment (the byte-budget-proof scope of 25×700KB
+rows already exists on `dashing-ermine-394`) and bootstrapping to done WITHOUT the throw —
+run by the coordinator after publish, not claimed fixed by this test suite alone.
+
+Version 0.4.6 -> 0.4.7. Task k170kqsam (URGENT re-fix).
+
+## 0.4.6 — 2026-08-15 — fix: byte-budgeted bootstrap (fixed pageSize=500 still blew the 16MiB read limit) — SUPERSEDED, see 0.4.7
 
 **Root cause, measured firsthand on prod deployment logs.** `bootstrapScopeCount` threw on a
 real prod scope (`jurisprudence-ca-null`): `Uncaught Error: Too many bytes read in a single
