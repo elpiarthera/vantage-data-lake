@@ -144,6 +144,61 @@ const results = await ctx.runQuery(components.dataLake.component.chunksV1.search
 });
 ```
 
+## Error contract — read `errorData.code`, not `errorMessage`
+
+Every consumer-reachable refusal in this Component throws `ConvexError({
+code, ...contextual data, message })` instead of a bare `Error` (v0.4.5+),
+so a structured payload is available at the client — but a Convex client
+that catches a `ConvexError` surfaces it as TWO fields, and only ONE of
+them carries the payload:
+
+- **`errorMessage`** — ALWAYS `"[Request ID: ...] Server Error"`. This is
+  the field most integrators reach for first, because it's the one named
+  "message" — and it tells you NOTHING. The opaque string did not go away;
+  reading `errorMessage` still looks like a generic server failure.
+- **`errorData`** — the structured payload: `{ code, orgId, scope, message }`
+  (fields vary by call site — see the code list below). **This is the field
+  to read.**
+
+**Read `errorData.code`; `errorMessage` will say `[Request ID: ...] Server
+Error` and that is expected.**
+
+### Live example (byte-for-byte, captured over the public `/api/query` endpoint)
+
+```json
+{"status":"error","errorMessage":"[Request ID: 35884417b1ad3150] Server Error","errorData":{"code":"scope_not_initialized","orgId":"proof-org","scope":"proof-never-seeded","message":"countChunks: scope not initialized for org=proof-org scope=proof-never-seeded — refusing to return 0 on an unmeasured scope; run bootstrapScopeCount first"}}
+```
+
+A client reads `response.errorData.code` (here, `"scope_not_initialized"`)
+to branch on the refusal — never `response.errorMessage`, which is the
+same opaque `"[Request ID: ...] Server Error"` string on every single
+refusal, indistinguishable from any other server-side failure.
+
+### Error codes (derived from source, not hand-typed)
+
+```bash
+grep -hoE 'code: "[a-z_]+"' component/*.ts | sort -u
+```
+
+```
+code: "embedding_required"
+code: "internal_invariant"
+code: "memory_not_found"
+code: "org_required"
+code: "scope_bootstrap_in_progress"
+code: "scope_has_unmeasured_rows"
+code: "scope_not_initialized"
+code: "scope_required"
+code: "too_many_ids"
+code: "write_refused_bootstrapping"
+```
+
+`scope_not_initialized` ("never seeded") and `scope_bootstrap_in_progress`
+("seeding in progress") are DISTINCT codes — a client can branch on which
+one it received. Re-run the grep above against your installed version to
+get the authoritative, current list; do not trust a hand-copied list in a
+doc that can drift from source.
+
 ## Deprecating `@vantageos/corpus`
 
 `@vantageos/corpus` is ABSORBED into this component's `chunksV1` namespace
