@@ -1120,31 +1120,32 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 
 // T6 — write-path integrity guard on chunksV1.insertChunks (the SERVED write
 // path: vantage-corpus-host mounts @vantageos/data-lake, @vantageos/corpus is
-// deprecated). Ported from vantage-corpus PR #9 (same fixtures, same four
-// cases), refusal shaped as a structured ConvexError like every other
-// chunksV1 refusal. RED recorded before the guard existed (see PR body):
+// deprecated). Ported from vantage-corpus PR #9 (same four cases), refusal
+// shaped as a structured ConvexError like every other chunksV1 refusal.
+// The two truncated fixtures are REAL windows cut from the archived decision
+// CA Poitiers, 27/06/2023, n° 21/02625 (Judilibre 649bd08d83350105dba0becf):
+// the start window begins "rtise amiable au contradictoire de la SMABTP…",
+// the exact offcut the corpus stored in production; the end window stops
+// on "…dernières concl", the same cut. The statute fixture is C. civ.
+// art. 1792-3 verbatim. RED recorded before the guard existed (see PR body):
 // the three MUST_BLOCK cases resolved instead of refusing.
 const T6_ORG = "org-t6";
 const T6_SCOPE = "juri-t6";
 
 const T6_TRUNCATED_MIDSTART = {
 	chunk_id: "trunc-midstart",
-	text:
-		"rtise amiable ordonnee le 3 mars, les parties ont comparu et la cour " +
-		"a rejete la demande en toutes ses fins.",
+	text: "rtise amiable au contradictoire de la SMABTP met donc en évidence avec certitude un défaut d'entretien et un usage anormal. - la SMABTP, bien que se trouvant dans une cause d'exclusion de sa garantie au sens de l'article 6.12 des conditions générales, a quand même versé l'indemnité à GROUPAMA subrogé dans les droits de son assuré le GAEC les ALIZES. - les conditions légales de la subrogation ne so",
 	section_title: "fragment",
 	legal_references: [],
-	source_ref: "judilibre/trunc-1",
+	source_ref: "judilibre/649bd08d83350105dba0becf",
 };
 
 const T6_TRUNCATED_MIDEND = {
 	chunk_id: "trunc-midend",
-	text:
-		"COUR D'APPEL DE COLMAR. Attendu que le salarie soutient que son " +
-		"licenciement repose sur une cause qui n'est pas reelle et dernieres concl",
+	text: "Dans le dernier état de ses conclusions récapitulatives, la SMABTP demandait au tribunal de : - Déclarer la SMABTP recevable et bien fondée en son action, - Condamner solidairement les sociétés L'AUXILIAIRE, AREAS DOMMAGES et SOFAREB à payer à la SMABTP la somme de 27.007,80 euros, - Condamner solidairement les sociétés L'AUXILIAIRE, SOFAREB et AREAS à payer à la SMABTP la somme de 3.000 euros au titre de l'article 700 du code de procédure civile, - Condamner solidairement les sociétés L'AUXILIAIRE, SOFAREB et AREAS aux entiers dépens. Par ses dernières concl",
 	section_title: "fragment",
 	legal_references: [],
-	source_ref: "judilibre/trunc-2",
+	source_ref: "judilibre/649bd08d83350105dba0becf",
 };
 
 const T6_COMPLETE_STATUTE = {
