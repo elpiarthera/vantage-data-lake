@@ -1,6 +1,6 @@
 # @vantageos/data-lake — Changelog
 
-## Unreleased — fix(chunksV1): the write path refuses truncated passages (T6)
+## 0.4.8 — 2026-10-05 — fix(chunksV1): the write path refuses truncated passages (T6)
 
 **`chunksV1.insertChunks` now refuses a chunk cut mid-word, before any write.** The served
 corpus write path is this package's `chunksV1` (the corpus host mounts `@vantageos/data-lake`;
@@ -17,6 +17,18 @@ corpus through this path in place of whole decisions.
   (`code: "chunk_text_truncated"`, `orgId`, `scope`, `chunk_id`, `message`), like the other
   `chunksV1` refusals.
 - `normalizeSourceChunk` is unchanged: the guard runs on the write path every loader uses.
+- **Scope of the floor, declared.** The 200-character floor applies to every domain that writes
+  through the generic `insertChunks`, not only jurisprudence. A text shorter than 200 characters
+  passes only if it is a complete unit: it starts on a capital letter, a digit or opening
+  punctuation, and ends on terminal punctuation. A short heading or a list item without a final
+  full stop is refused. A domain that needs to store such fragments must say so. The floor then
+  becomes a per-scope parameter in a later version. It is not removed silently. (Argus review
+  note on #15.)
+- **Fixtures of real origin.** The two truncated fixtures are windows cut from the archived
+  decision CA Poitiers, 27/06/2023, n° 21/02625 (Judilibre `649bd08d83350105dba0becf`). They
+  stop on the same cuts the production corpus stored ("rtise amiable…" / "…dernières concl").
+  The statute fixture is C. civ. art. 1792-3, quoted word for word. (Argus review note on #15.)
+- `package-lock.json` had stayed at 0.4.3 since 0.4.4. It is realigned on 0.4.8 by `npm version`.
 
 Tests: 4 new cases in `component/chunksV1.test.ts` (3 MUST_BLOCK, 1 MUST_PASS). RED before
 the guard: 3 failed | 30 passed. GREEN: full suite 81/81. Probe: with the call neutralized,
