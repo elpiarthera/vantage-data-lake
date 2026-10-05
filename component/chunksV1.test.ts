@@ -1117,3 +1117,114 @@ describe("component/chunksV1.ts — bootstrapScopeCount (historical scopes, refu
 		expect(count).toBe(N);
 	});
 });
+
+// T6 — write-path integrity guard on chunksV1.insertChunks (the SERVED write
+// path: vantage-corpus-host mounts @vantageos/data-lake, @vantageos/corpus is
+// deprecated). Ported from vantage-corpus PR #9 (same fixtures, same four
+// cases), refusal shaped as a structured ConvexError like every other
+// chunksV1 refusal. RED recorded before the guard existed (see PR body):
+// the three MUST_BLOCK cases resolved instead of refusing.
+const T6_ORG = "org-t6";
+const T6_SCOPE = "juri-t6";
+
+const T6_TRUNCATED_MIDSTART = {
+	chunk_id: "trunc-midstart",
+	text:
+		"rtise amiable ordonnee le 3 mars, les parties ont comparu et la cour " +
+		"a rejete la demande en toutes ses fins.",
+	section_title: "fragment",
+	legal_references: [],
+	source_ref: "judilibre/trunc-1",
+};
+
+const T6_TRUNCATED_MIDEND = {
+	chunk_id: "trunc-midend",
+	text:
+		"COUR D'APPEL DE COLMAR. Attendu que le salarie soutient que son " +
+		"licenciement repose sur une cause qui n'est pas reelle et dernieres concl",
+	section_title: "fragment",
+	legal_references: [],
+	source_ref: "judilibre/trunc-2",
+};
+
+const T6_COMPLETE_STATUTE = {
+	chunk_id: "cciv-1792-3",
+	text:
+		"Les autres éléments d'équipement de l'ouvrage font l'objet d'une " +
+		"garantie de bon fonctionnement d'une durée minimale de deux ans à " +
+		"compter de sa réception.",
+	section_title: "Code civil — art. 1792-3",
+	legal_references: ["1792-3"],
+	source_ref: "legifrance/LEGIARTI000006443534",
+};
+
+async function t6Rows(t: ReturnType<typeof createT>) {
+	return t.run(async (ctx) =>
+		ctx.db
+			.query("chunks")
+			.withIndex("by_org_scope", (q) => q.eq("orgId", T6_ORG).eq("scope", T6_SCOPE))
+			.collect(),
+	);
+}
+
+async function expectTruncationRefusal(promise: Promise<unknown>): Promise<void> {
+	await expectRefusal(promise, "chunk_text_truncated", T6_ORG, T6_SCOPE);
+	let caught: unknown;
+	try {
+		await promise;
+	} catch (err) {
+		caught = err;
+	}
+	const data = (caught as ConvexError<string>).data;
+	const parsed = typeof data === "string" ? JSON.parse(data) : data;
+	expect(parsed.message).toMatch(/truncated|mid-word/i);
+}
+
+describe("component/chunksV1.ts — insertChunks write-path integrity guard (T6)", () => {
+	test("MUST_BLOCK: insertChunks rejects a chunk starting mid-word, nothing written", async () => {
+		const t = createT();
+		await expectTruncationRefusal(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: T6_ORG,
+				scope: T6_SCOPE,
+				chunks: [T6_TRUNCATED_MIDSTART],
+			}),
+		);
+		expect(await t6Rows(t)).toHaveLength(0);
+	});
+
+	test("MUST_BLOCK: insertChunks rejects a chunk ending mid-word", async () => {
+		const t = createT();
+		await expectTruncationRefusal(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: T6_ORG,
+				scope: T6_SCOPE,
+				chunks: [T6_TRUNCATED_MIDEND],
+			}),
+		);
+		expect(await t6Rows(t)).toHaveLength(0);
+	});
+
+	test("MUST_BLOCK: a truncated chunk mixed with a clean one refuses the whole batch — nothing written", async () => {
+		const t = createT();
+		await expectTruncationRefusal(
+			t.mutation(api.chunksV1.insertChunks, {
+				orgId: T6_ORG,
+				scope: T6_SCOPE,
+				chunks: [T6_COMPLETE_STATUTE, T6_TRUNCATED_MIDSTART],
+			}),
+		);
+		expect(await t6Rows(t)).toHaveLength(0);
+	});
+
+	test("MUST_PASS: insertChunks accepts a complete short statute unit (no false positive)", async () => {
+		const t = createT();
+		const inserted = await t.mutation(api.chunksV1.insertChunks, {
+			orgId: T6_ORG,
+			scope: T6_SCOPE,
+			chunks: [T6_COMPLETE_STATUTE],
+		});
+		expect(inserted).toBe(1);
+		expect(await t6Rows(t)).toHaveLength(1);
+	});
+});

@@ -36,6 +36,7 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server.js";
 import type { MutationCtx } from "./_generated/server.js";
+import { assertTextIntegrity } from "./normalizeSourceChunk.js";
 
 // Structured refusal payloads (Pi + operator finding, follow-up to REVISE
 // rounds 1-2): a plain Error thrown with a bare string reaches every Convex
@@ -240,6 +241,23 @@ export const insertChunks = mutation({
 	returns: v.number(),
 	handler: async (ctx, args) => {
 		requireOrgScope(args.orgId, args.scope);
+		// T6 write-path guard: refuse a truncated fragment BEFORE any write.
+		// The WHOLE batch is validated first, so one bad chunk refuses the
+		// batch atomically (no partial write, counter untouched). Removing
+		// this loop turns the T6 MUST_BLOCK tests in chunksV1.test.ts RED.
+		for (const chunk of args.chunks) {
+			try {
+				assertTextIntegrity(chunk.chunk_id, chunk.text);
+			} catch (err) {
+				throw new ConvexError({
+					code: "chunk_text_truncated" as const,
+					orgId: args.orgId,
+					scope: args.scope,
+					chunk_id: chunk.chunk_id,
+					message: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 		await ensureScopeMeasuredForWrite(ctx, args.orgId, args.scope, "insertChunks");
 		const now = Date.now();
 		for (const chunk of args.chunks) {

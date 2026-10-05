@@ -1,5 +1,27 @@
 # @vantageos/data-lake — Changelog
 
+## Unreleased — fix(chunksV1): the write path refuses truncated passages (T6)
+
+**`chunksV1.insertChunks` now refuses a chunk cut mid-word, before any write.** The served
+corpus write path is this package's `chunksV1` (the corpus host mounts `@vantageos/data-lake`;
+`@vantageos/corpus` is deprecated), but the text-integrity guard only existed in the
+deprecated package. Windowed extractions of ~800 characters had entered the jurisprudence
+corpus through this path in place of whole decisions.
+
+- `assertTextIntegrity` is ported into `component/normalizeSourceChunk.ts` (same contract
+  as `@vantageos/corpus`): it refuses a text that starts mid-word, ends mid-word, or sits
+  under a 200-character floor without being a complete short unit. A complete short statute
+  (clean start + terminal punctuation) stays accepted.
+- `insertChunks` validates the **whole batch** before any write, including the scope counter.
+  One bad chunk refuses the batch atomically. The refusal is a structured `ConvexError`
+  (`code: "chunk_text_truncated"`, `orgId`, `scope`, `chunk_id`, `message`), like the other
+  `chunksV1` refusals.
+- `normalizeSourceChunk` is unchanged: the guard runs on the write path every loader uses.
+
+Tests: 4 new cases in `component/chunksV1.test.ts` (3 MUST_BLOCK, 1 MUST_PASS). RED before
+the guard: 3 failed | 30 passed. GREEN: full suite 81/81. Probe: with the call neutralized,
+exactly the 3 MUST_BLOCK cases fail (3 failed | 78 passed); restored byte-identical → 81/81.
+
 ## 0.4.7 — 2026-08-15 — fix: 0.4.6's "byte-budget" was a false fix — reverted to `.take(k)`, the only construct that bounds the runtime read
 
 **0.4.6 did not fix the defect it claimed to fix.** Measured firsthand by the coordinator on

@@ -105,6 +105,63 @@ export type SourceChunk = {
 	sourceRef: unknown;
 };
 
+// T6 — text integrity, ported from @vantageos/corpus (PR #9) now that the
+// served write path is this package's chunksV1. A windowed extraction (a
+// fixed-character window over a source document) yields a fragment cut
+// mid-word at both ends — the defect that put ~800-char blind windows
+// ("rtise amiable…" / "…dernières concl") into the jurisprudence corpus in
+// place of the full decision text.
+//
+// Fail CLOSED, naming the chunk_id + the reason. Three signatures:
+//   1. starts mid-word — first non-space char is a lowercase letter.
+//   2. ends mid-word — last non-space char is a lowercase letter with no
+//      terminal punctuation.
+//   3. below a length floor — EXCEPT a text that both starts clean and ends
+//      on terminal punctuation: a COMPLETE short unit (e.g. C. civ. art.
+//      1792-3) is deliberately exempt. Declared exemption: the floor targets
+//      truncated fragments, never a short-but-whole statute.
+//
+// Declared scope: called on the write path (chunksV1.insertChunks), which
+// every loader goes through. normalizeSourceChunk below is left unchanged.
+export const MIN_JURISPRUDENCE_CHARS = 200;
+
+const STARTS_LOWERCASE = /^\p{Ll}/u;
+const ENDS_LOWERCASE = /\p{Ll}$/u;
+const TERMINAL_PUNCTUATION = /[.!?»)…]$/u;
+
+export function assertTextIntegrity(chunkId: string, rawText: unknown): void {
+	if (typeof rawText !== "string") {
+		throw new Error(
+			`chunk ${chunkId}: text is not a string (got ${typeof rawText}) — refusing an unstorable chunk.`,
+		);
+	}
+	const text = rawText.trim();
+	if (text.length === 0) {
+		throw new Error(`chunk ${chunkId}: text is empty after trim — refusing an empty chunk.`);
+	}
+	if (STARTS_LOWERCASE.test(text)) {
+		throw new Error(
+			`chunk ${chunkId}: text starts mid-word (first non-space char is a lowercase letter: ${JSON.stringify(
+				text.slice(0, 24),
+			)}…) — this is a truncated window, not a whole passage. Refusing.`,
+		);
+	}
+	const endsOnTerminalPunctuation = TERMINAL_PUNCTUATION.test(text);
+	if (!endsOnTerminalPunctuation && ENDS_LOWERCASE.test(text)) {
+		throw new Error(
+			`chunk ${chunkId}: text ends mid-word (last char is a lowercase letter with no terminal punctuation: …${JSON.stringify(
+				text.slice(-24),
+			)}) — this is a truncated window, not a whole passage. Refusing.`,
+		);
+	}
+	const looksComplete = !STARTS_LOWERCASE.test(text) && endsOnTerminalPunctuation;
+	if (!looksComplete && text.length < MIN_JURISPRUDENCE_CHARS) {
+		throw new Error(
+			`chunk ${chunkId}: text is ${text.length} chars, below the ${MIN_JURISPRUDENCE_CHARS}-char floor and not a complete short unit (clean start + terminal punctuation) — refusing a suspected truncated fragment.`,
+		);
+	}
+}
+
 export function normalizeSourceChunk(sourceChunk: SourceChunk): NormalizedChunk {
 	const normalized: NormalizedChunk = {
 		chunk_id: sourceChunk.chunkId,
