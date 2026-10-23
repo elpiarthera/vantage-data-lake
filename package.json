@@ -50,6 +50,8 @@
     "@convex-dev/rag": "^0.7.5"
   },
   "overrides": {
-    "@fastify/busboy": "3.2.1"
+    "@fastify/busboy": "3.2.1",
+    "undici@^5": "^6.27.0",
+    "zod@^4": "^4.6.6"
   }
 }
